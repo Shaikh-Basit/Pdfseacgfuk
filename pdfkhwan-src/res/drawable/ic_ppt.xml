@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- presentation slide board (PowerPoint orange) -->
+    <path
+        android:fillColor="#D24726"
+        android:pathData="M6,8 L42,8 A2,2 0 0 1 44,10 L44,34 A2,2 0 0 1 42,36 L6,36 A2,2 0 0 1 4,34 L4,10 A2,2 0 0 1 6,8 Z" />
+    <!-- title bar -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M10,15 L30,15 L30,19 L10,19 Z" />
+    <!-- body lines -->
+    <path
+        android:fillColor="#FFD9C7"
+        android:pathData="M10,23 L38,23 L38,26 L10,26 Z" />
+    <path
+        android:fillColor="#FFD9C7"
+        android:pathData="M10,29 L32,29 L32,32 L10,32 Z" />
+    <!-- stand -->
+    <path
+        android:fillColor="#D24726"
+        android:pathData="M22,36 L26,36 L26,42 L22,42 Z" />
+    <path
+        android:fillColor="#D24726"
+        android:pathData="M16,46 L24,40 L32,46 Z" />
+</vector>

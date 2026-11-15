@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <!-- stacked pages (page subset / range) -->
+    <path android:pathData="M8 3h6l4 4v10H8z" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.8" android:strokeLineJoin="round" android:fillColor="#00000000"/>
+    <path android:pathData="M14 3v4h4" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.8" android:strokeLineJoin="round" android:fillColor="#00000000"/>
+    <path android:pathData="M5.5 7.5V20a1 1 0 0 0 1 1H16" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.8" android:strokeLineCap="round" android:fillColor="#00000000"/>
+</vector>

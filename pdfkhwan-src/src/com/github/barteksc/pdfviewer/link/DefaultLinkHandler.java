@@ -1,0 +1,80 @@
+/**
+ * Copyright 2017 Bartosz Schiller
+ * <p/>
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * <p/>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p/>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.github.barteksc.pdfviewer.link;
+
+import android.content.ActivityNotFoundException;
+import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.util.Log;
+
+import com.github.barteksc.pdfviewer.PDFView;
+import com.github.barteksc.pdfviewer.model.LinkTapEvent;
+
+public class DefaultLinkHandler implements LinkHandler {
+
+    private static final String TAG = DefaultLinkHandler.class.getSimpleName();
+
+    private PDFView pdfView;
+
+    public DefaultLinkHandler(PDFView pdfView) {
+        this.pdfView = pdfView;
+    }
+
+    @Override
+    public void handleLinkEvent(LinkTapEvent event) {
+        String uri = event.getLink().getUri();
+        Integer page = event.getLink().getDestPageIdx();
+        if (uri != null && !uri.isEmpty()) {
+            handleUri(uri);
+        } else if (page != null) {
+            handlePage(page);
+        }
+    }
+
+    private void handleUri(String uri) {
+        Uri parsedUri = Uri.parse(uri);
+        String scheme = parsedUri.getScheme();
+        /* v7: scheme allow-list — a crafted PDF can embed intent://, file://
+           or custom-scheme URIs; an offline reader only ever opens web,
+           mail and phone links. Also drops the resolveActivity() gate that
+           silently killed http/https links on Android 11+ (package
+           visibility filtering) — startActivity with try/catch instead. */
+        if (scheme == null) {
+            scheme = "";
+        }
+        scheme = scheme.toLowerCase(java.util.Locale.US);
+        if (!scheme.equals("http") && !scheme.equals("https") &&
+                !scheme.equals("mailto") && !scheme.equals("tel")) {
+            Log.w(TAG, "Blocked non-web link scheme: " + scheme);
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_VIEW, parsedUri);
+        Context context = pdfView.getContext();
+        try {
+            if (!(context instanceof android.app.Activity)) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            }
+            context.startActivity(intent);
+        } catch (ActivityNotFoundException e) {
+            Log.w(TAG, "No activity found for URI: " + uri);
+        }
+    }
+
+    private void handlePage(int page) {
+        pdfView.jumpTo(page);
+    }
+}

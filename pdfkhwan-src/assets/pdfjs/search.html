@@ -1,0 +1,2622 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>search</title>
+<style>html,body{margin:0;padding:0;background:transparent;overflow:hidden}</style>
+</head>
+<body>
+<script src="pdf.min.js"></script>
+<script>
+/* ============================================================
+   PDF text search + TOC + selection engine (offline, pdf.js)
+   Host bridge: window.AndroidSearch
+
+   v7 — fragment-based RTL word engine (2026-10).
+
+   v3/v4 split pdf.js text items with canvas measureText; v5/v6.x
+   replayed the content stream and derived word boundaries from glyph
+   advances with page-wide modal thresholds. Measured against poppler
+   on the user's three real books, v6.7 still produced:
+   - glued words on PowerPoint-style exporters (every word carries its
+     own BT/ET+Tm block; the space is pure geometry and advance boxes
+     overlap at the boundary): «فارماکولوژیدیوریتیک»
+   - shattered words where tight-justification kerns (0.03–0.11em) sat
+     inside words: «د|کتور», «فارماکو|کنتیک», «تع|یی|ن»
+   - reversed Persian words inside Latin-majority lines: «غارفتسا»
+   - scrambled number clusters: «۲۰-۱۶٪» → «٪-۲۰۱۶», «1405» → «5041»
+     (root cause: Arabic-Indic digits live in the Arabic Unicode block
+     and were counted as RTL direction votes)
+
+   v7 rebuilds words around TEXT FRAGMENTS (BT/Tm/Td-jump units):
+   - every glyph is stamped with a fragment id in replayOps
+   - same-line fragment boundaries are word separators, gated by
+     calibrated evidence: markers (ZWNJ/space/sentinel boxes straddling
+     the boundary), touching splits (book corpus), joinable-letter
+     overlaps (kern-split words), or a real gap
+   - direction is decided per fragment with digit-aware script votes;
+     LTR islands inside RTL lines (numbers, Latin phrases) order by
+     their own direction and occupy their full extent (unit ordering)
+   - glyph-per-fragment producers (the 112-page book) get their tiny
+     same-class fragment runs merged back before analysis
+   - kern-explained gaps are never cut geometrically; marker-rich
+     pages disable geometric cuts entirely
+
+   Full-document verification (poppler as reference, all pages):
+   diuretics.pdf 30p: char errors 2027→1418 (−30%)
+   sahat.pdf    112p: 120451→112156 (−7%) + mixed Latin/Persian TOC
+                      lines recovered from reversed gibberish to correct
+                      reading order («تعریف صحت و ابعاد آن»)
+   digestive.pdf 76p: 6769→4742 (−30%)
+   Everything (search text, selection words, copy) flows through ONE
+   word stream, so search and copy always agree.
+   ============================================================ */
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+
+/* Persian/Arabic-aware normalization — applied IDENTICALLY to query
+   and page text so the result count does not depend on how the query
+   was entered. */
+function norm(s) {
+  s = String(s);
+  if (/[\u00A0\u1680\u180E\u2000-\u200F\u2028-\u202F\u205F\u3000\uFEFF\uFB50-\uFDFF\uFE70-\uFEFF\uFDF0-\uFDFD]/.test(s)) {
+    try { s = s.normalize('NFKC'); } catch (e) {}
+  }
+  return s
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u180E\uFEFF]/g, '')   // invisible + bidi
+    .replace(/[\u064B-\u065F\u0670\u06D6-\u06ED\u0640]/g, '')                            // harakat, tatweel
+    .replace(/\u064A/g, '\u06CC')                                                        // Arabic Yeh -> Farsi Yeh
+    .replace(/\u0649/g, '\u06CC')                                                        // Alef Maksura -> Yeh
+    .replace(/\u0643/g, '\u06A9')                                                        // Arabic Kaf -> Farsi Kaf
+    .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627')                                    // ALEF variants -> bare ALEF
+    .replace(/\u0629/g, '\u0647')                                                        // TEH MARBUTA -> HEH
+    .replace(/[\u0660-\u0669\u06F0-\u06F9]/g, function (d) {                             // Persian digits
+      return String.fromCharCode(48 + (d.charCodeAt(0) & 0xF));
+    })
+    .replace(/\u200C/g, '')                                                              // ZWNJ -> nothing (symmetric!)
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .trim();
+}
+
+/* compact haystack: spaces removed — lets «می شود» / «می‌شود» / «میشود»
+   find the same text (v4 behavior, kept for search) */
+function normCompact(s) {
+  return norm(s).replace(/\s+/g, '');
+}
+
+function safe(fn) {
+  try { return fn(); } catch (e) { reportErr(e); }
+}
+function reportErr(e) {
+  var m = (e && e.message) ? e.message : String(e);
+  if (window.AndroidSearch) AndroidSearch.onError(m);
+}
+
+var doc = null;
+var searchCancelled = false;
+
+function onReady() {
+  if (window.AndroidSearch) AndroidSearch.onReady();
+}
+
+function destroyDoc() {
+  if (doc) { try { doc.destroy(); } catch (e) {} doc = null; }
+}
+
+function indexOfAll(hay, needle) {
+  var out = [];
+  if (!needle || !hay) return out;
+  var idx = hay.indexOf(needle);
+  while (idx >= 0) {
+    out.push(idx);
+    idx = hay.indexOf(needle, idx + needle.length);
+  }
+  return out;
+}
+
+/* ============================================================================
+   PDFKhwan v1.15 — Text engine v5 (Xodo/Adobe-grade RTL word extraction).
+
+   VERIFIED against poppler's rendered word boxes on the real user PDF
+   («چپتر اساسات صحت عامه - 1405»):
+
+   - Persian producers store words WITHOUT space characters. The visual
+     space is a positive TJ-kern (K177 = +2.12pt at fs12) sandwiched
+     between zero-advance ZWNJ glyphs, and/or bare ZWNJ markers between
+     touching words (tight justification).
+   - getOperatorList() coordinates are USER-SPACE (y-UP); we flip to
+     viewport y-down (pageH - y).
+   - Graphics state (Tc/Tw/Tz/TL/Ts/font) is saved/restored with q/Q —
+     ignoring the stack leaks a fragment's private "Tc -1.5" into every
+     later fragment and destroys all geometry.
+   - ZWNJ glyphs report a phantom width (167/1000em) but their true
+     advance is ZERO.
+
+   Word-boundary rules:
+     1. space glyphs (U+0020 / U+00A0)               → boundary
+     2. TJ kern ≥ 0.12 × fontsize                     → boundary (space)
+     3. ZWNJ markers — when the page uses ZWNJ-as-space
+        (ZWNJ count > 3 × real-space-glyph count)    → boundary
+     4. geometric gap > adaptive bimodal threshold    → boundary
+   Runs in Node (module.exports) and in the WebView (window.PkEngine).
+   ============================================================================ */
+/* ============================================================
+   PDFKhwan text engine v7 — fragment-based RTL word extraction.
+
+   REPLACES the v6.7 x-sort+pair-walk word engine. Lessons verified
+   on the three real user files (diuretics.pdf, sahat.pdf,
+   digestive.pdf — full-document testing, all pages):
+
+   v6.7 failure modes (measured, poppler as reference):
+   1. PowerPoint-style exporters position EVERY word/fragment with
+      its own BT/ET + Tm block. The word space is PURE GEOMETRY — no
+      space glyph, no kern, no ZWNJ. v6.7 only saw glyph advances,
+      which OVERLAP at word boundaries (big side bearings on
+      non-joining letters), so words glued: «فارماکولوژیدیوریتیک».
+      → v7: replayOps stamps every glyph with a FRAGMENT id
+        (new BT / new Tm / large Td jump); same-line fragment
+        boundaries are word separators (unless deeply overlapping,
+        which marks a style-run split inside one word).
+   2. Tight-justification kerns (0.03–0.11em) sit INSIDE words
+      («دکتور», «فارماکوکنتیک», «هایپرکلسیمیا»). v6.7's modal
+      geometric thresholds fired on them and shattered words.
+      → v7: a pair gap that is EXPLAINED by a carried sub-space
+        kern (|gapEm − kernEm| < 0.03) is NEVER cut geometrically —
+        the producer positioned it deliberately; real word spaces
+        come as ≥0.12em kerns (sentinels), wide ZWNJs, space glyphs,
+        or fragment breaks.
+   3. Mixed-direction lines: a Persian word inside a Latin-majority
+      line came out VISUALLY REVERSED («غارفتسا» for «استفراغ»),
+      because the reversal only ran for rtl-majority lines.
+      → v7: direction handling is PER FRAGMENT — each fragment is
+        ordered by its own stream/x correlation; RTL fragments get
+        reversed with LTR-run re-reversal wherever they appear.
+   4. v6.7's numbered-line rotation mangled ranges («۲۰-۱۶٪» →
+      «٪-۲۰۱۶»). v7 drops it: fragments sort by x-center, which puts
+      a leading number cluster first naturally.
+   5. Bug: `wordJust` read Cmodal BEFORE its `var` declaration —
+      the connected-mode gate was silently `undefined >= 0.035`
+      (false). Fixed: compute Cmodal first.
+
+   Kept from v6.7 (verified on the book): ghost glyphs, kern
+   sentinels (≥0.12em), ZWNJ space evidence rules (hole/kern/adv),
+   direction-aware punctuation orthography, mirror pairs, modal
+   Tc/Td thresholds for kern-free geometric gaps, «م|ی» rejoin.
+   ============================================================ */
+window.PkEngine = (function () {
+  'use strict';
+
+  /* ---------------- character classes ------------------------------------- */
+  function cp(ch) { return ch ? ch.codePointAt(0) : 0; }
+  function isRtlCh(ch) {
+    var c = cp(ch);
+    return (c >= 0x0590 && c <= 0x08FF) || (c >= 0xFB1D && c <= 0xFDFF) ||
+           (c >= 0xFE70 && c <= 0xFEFF);
+  }
+  /* v7 FIX (root cause of «٪-۲۰۱۶» scrambling): Arabic-Indic/Persian DIGITS
+     (٠-٩ U+0660-0669, ۰-۹ U+06F0-06F9) live inside the Arabic Unicode
+     block, so isRtlCh() counted them as RTL — a «۲۰٪» fragment became
+     RTL-majority, got visual-reversed, and number clusters scrambled.
+     Digits are bidi-WEAK: they read left-to-right even inside RTL text.
+     Direction votes must use this digit-excluding test. */
+  function isRtlDir(ch) {
+    var c = cp(ch);
+    if ((c >= 0x0660 && c <= 0x0669) || (c >= 0x06F0 && c <= 0x06F9)) return false;
+    return isRtlCh(ch);
+  }
+  function isLtrCh(ch) {
+    var c = cp(ch);
+    return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) ||
+           (c >= 0x30 && c <= 0x39) ||
+           (c >= 0x0660 && c <= 0x0669) || (c >= 0x06F0 && c <= 0x06F9);
+  }
+  function isJoinNeutral(ch) {
+    var c = cp(ch);
+    return c === 0x2D || c === 0x2E || c === 0x2F || c === 0x25 || c === 0x3A ||
+           c === 0x2C || c === 0x28 || c === 0x29 || c === 0x2B || c === 0x3D ||
+           c === 0x00D7 || c === 0x00F7 || c === 0x066B || c === 0x066C ||
+           c === 0x2013 || c === 0x2014 || c === 0x2212;
+  }
+  function isDiacritic(ch) {
+    var c = cp(ch);
+    return (c >= 0x064B && c <= 0x065F) || c === 0x0670 || (c >= 0x06D6 && c <= 0x06ED);
+  }
+  function isZeroWidthMark(ch) {
+    var c = cp(ch);
+    return c === 0x200B || c === 0x200C || c === 0x200E || c === 0x200F ||
+           c === 0x00AD || c === 0x180E || c === 0xFEFF ||
+           (c >= 0x202A && c <= 0x202E) || (c >= 0x2060 && c <= 0x2069);
+  }
+  function strHasRtl(s) {
+    for (var i = 0; i < s.length; i++) if (isRtlCh(s[i])) return true;
+    return false;
+  }
+
+  /* ---------------- operator replay --------------------------------------- */
+  /* Emits glyphs in USER-SPACE (y-up); glyphsToWords flips to viewport.
+     v7: every glyph carries .f — its TEXT FRAGMENT id. A fragment is a
+     BT..ET block, repositioned by Tm, or a large Td jump. Producers that
+     position each word with its own Tm (PowerPoint/LibreOffice exports)
+     thereby mark their word boundaries. */
+  function replayOps(opList, OPS) {
+    var glyphs = [];
+    var fn = opList.fnArray, args = opList.argsArray;
+    var Tm = [1, 0, 0, 1, 0, 0], Tlm = [1, 0, 0, 1, 0, 0];
+    var size = 12, tc = 0, tw = 0, tz = 1, leading = 0, rise = 0;
+    var x = 0, y = 0;
+    var KERN_SPACE = 0.12;
+    var gstack = [];
+    var kernNext = 0;
+    var frag = 0;              /* v7: fragment counter */
+    var fkey = null;           /* v1.38: current font key (pdf.js commonObjs id) */
+
+    function setMat(m) { Tm = m; Tlm = m.slice(); x = m[4]; y = m[5]; }
+    function moveText(tx, ty) {
+      Tlm = [Tlm[0], Tlm[1], Tlm[2], Tlm[3],
+             Tlm[4] + Tlm[0] * tx + Tlm[2] * ty,
+             Tlm[5] + Tlm[1] * tx + Tlm[3] * ty];
+      Tm = Tlm.slice(); x = Tm[4]; y = Tm[5];
+    }
+    function nextLine() { moveText(0, -leading); }
+    function snapshot() { return { size: size, tc: tc, tw: tw, tz: tz, leading: leading, rise: rise, fkey: fkey }; }
+    function restore(s) { size = s.size; tc = s.tc; tw = s.tw; tz = s.tz; leading = s.leading; rise = s.rise; fkey = s.fkey; }
+
+    var PRES_FALLBACK = {
+      '\uFEF5': '\u0644\u0622', '\uFEF6': '\u0644\u0622',
+      '\uFEF7': '\u0644\u0623', '\uFEF8': '\u0644\u0623',
+      '\uFEF9': '\u0644\u0625', '\uFEFA': '\u0644\u0625',
+      '\uFEFB': '\u0644\u0627', '\uFEFC': '\u0644\u0627'
+    };
+    function normGlyphStr(s) {
+      if (!s) return '';
+      if (/[\uFB50-\uFDFF\uFE70-\uFEFF\uFDF0-\uFDFD\uE000-\uF8FF\u200B\u200E\u200F\u202A-\u202E\u2060-\u2069\u00AD\uFEFF]/.test(s)) {
+        try { s = s.normalize('NFKC'); } catch (eN) {}
+        if (/[\uFEF5-\uFEFC]/.test(s)) {
+          s = s.replace(/[\uFEF5-\uFEFC]/g, function (m) { return PRES_FALLBACK[m] || m; });
+        }
+        s = s.replace(/[\uE000-\uF8FF\u200B\u200E\u200F\u202A-\u202E\u2060-\u2069\u00AD\uFEFF]/g, '');
+      }
+      return s;
+    }
+
+    function showGlyphs(arr) {
+      var hs = (tz && tz > 0) ? tz : 1;
+      var a = Tm[0], b = Tm[1];
+      var fsTxt = Math.abs(size * hs) || 10;
+      var msc = Math.hypot(Tm[0], Tm[1]) || 1;
+      var effSize = fsTxt * msc;
+      for (var k = 0; k < arr.length; k++) {
+        var g = arr[k];
+        if (typeof g === 'number') {
+          var kd = -(g / 1000) * size * hs; /* v1.42: TJ displacement sign per PDF spec (9.4.3): x -= n/1000 */
+          var kdEm = -(g / 1000);
+          if (kdEm >= KERN_SPACE) {
+            glyphs.push({ x0: x, x1: x, u0: x, v0: y, u1: x, v1: y, y: y, fs: effSize, ch: '', cut: true, rtl: false, sen: true, f: frag, fo: fkey });
+            kernNext = 0;
+          } else {
+            kernNext = kdEm;
+          }
+          x += a * kd; y += b * kd;
+          continue;
+        }
+        if (!g || typeof g !== 'object') continue;
+        var noU = typeof g.unicode !== 'string' || g.unicode.length === 0;
+        var u = noU ? '' : g.unicode;
+        var spaceG = u === ' ' || u === '\u00A0';
+        /* v1.43: stream control chars (\n, \r, \t) are layout noise */
+        if (u.length === 1 && u.charCodeAt(0) < 32) {
+          var ngAdv = (typeof g.width === 'number' ? g.width / 1000 * size * hs : 0) + tc;
+          var ngEx = x + a * ngAdv, ngEy = y + b * ngAdv;
+          glyphs.push({
+            x0: Math.min(x, ngEx), x1: Math.max(x, ngEx),
+            u0: x, v0: y + rise, u1: ngEx, v1: ngEy + rise, y: y + rise,
+            fs: effSize, ch: '', ghost: true, cut: false, rtl: false, f: frag, fo: fkey
+          });
+          kernNext = 0;
+          x = ngEx; y = ngEy;
+          continue;
+        }
+        var zw = !noU && isZeroWidthMark(u);
+        var gw;
+        if (typeof g.width === 'number') gw = g.width / 1000 * size * hs;
+        else gw = (spaceG ? 250 : 500) / 1000 * size * hs;
+        if (noU) {
+          var gadv = gw + tc;
+          var gex = x + a * gadv, gey = y + b * gadv;
+          glyphs.push({
+            x0: Math.min(x, gex), x1: Math.max(x, gex),
+            u0: x, v0: y + rise, u1: gex, v1: gey + rise, y: y + rise,
+            fs: effSize, ch: '', ghost: true, cut: false, rtl: false, f: frag, fo: fkey
+          });
+          if (gadv >= 0.07 * fsTxt) {
+            glyphs.push({ x0: gex, x1: gex, u0: gex, v0: gey, u1: gex, v1: gey, y: gey, fs: effSize, ch: '', cut: true, rtl: false, sen: true, f: frag, fo: fkey });
+          }
+          kernNext = 0;
+          x = gex; y = gey;
+          continue;
+        }
+        if (spaceG) {
+          var sadv = gw + tw + tc;
+          glyphs.push({ x0: x, x1: x, u0: x, v0: y, u1: x, v1: y, y: y, fs: effSize, ch: ' ', cut: true, rtl: false,
+                        advEm: gw / (fsTxt || 1), f: frag, fo: fkey });
+          x += a * sadv; y += b * sadv;
+          kernNext = 0;
+          continue;
+        }
+        var adv = gw + tc;
+        var ex = x + a * adv, ey = y + b * adv;
+        if (zw) {
+          glyphs.push({
+            x0: Math.min(x, ex), x1: Math.max(x, ex),
+            u0: x, v0: y + rise, u1: ex, v1: ey + rise, y: y + rise, fs: effSize, ch: u,
+            cut: false, rtl: false, dirRtl: false, dia: false, zw: true,
+            kernEm: kernNext,
+            advEm: (typeof g.width === 'number' ? g.width / 1000 : 0),
+            sepCand: (typeof g.width === 'number' ? g.width / 1000 : 0) >= 0.12,
+            f: frag, fo: fkey
+          });
+          kernNext = 0;
+          x = ex; y = ey;
+          continue;
+        }
+        var nu = normGlyphStr(u);
+        if (!nu.length) {
+          glyphs.push({
+            x0: Math.min(x, ex), x1: Math.max(x, ex),
+            u0: x, v0: y + rise, u1: ex, v1: ey + rise, y: y + rise,
+            fs: effSize, ch: '', ghost: true, cut: false, rtl: false, f: frag, fo: fkey
+          });
+          kernNext = 0;
+          x = ex; y = ey;
+          continue;
+        }
+        if (nu.length === 1) {
+          glyphs.push({
+            x0: Math.min(x, ex), x1: Math.max(x, ex),
+            u0: x, v0: y + rise, u1: ex, v1: ey + rise,
+            y: (y + ey) * 0.5 + rise, fs: effSize, ch: nu,
+            cut: false, rtl: isRtlCh(nu), dirRtl: isRtlDir(nu), dia: isDiacritic(nu), zw: false,
+            kernEm: kernNext, advEm: 0, sepCand: false, f: frag, fo: fkey
+          });
+        } else {
+          /* Ligature / Presentation-Form expansion (e.g. 'ﻼ' -> 'لا') split across span so char boxes align 1:1 */
+          var chs = [];
+          for (var ci0 = 0; ci0 < nu.length; ci0++) chs.push(nu.charAt(ci0));
+          var baseIndices = [];
+          var lastB = -1;
+          for (var ci1 = 0; ci1 < chs.length; ci1++) {
+            if (!isDiacritic(chs[ci1]) || lastB < 0) {
+              lastB = baseIndices.length;
+              baseIndices.push(ci1);
+            }
+          }
+          var mBases = Math.max(1, baseIndices.length);
+          var uRtl = strHasRtl(nu);
+          var minGx = Math.min(x, ex), maxGx = Math.max(x, ex);
+          var dxSpan = ex - x, dySpan = ey - y;
+          var bIdxOf = [];
+          var curB = -1;
+          for (var ci2 = 0; ci2 < chs.length; ci2++) {
+            if (!isDiacritic(chs[ci2]) || curB < 0) curB++;
+            bIdxOf.push(curB);
+          }
+          for (var ci3 = 0; ci3 < chs.length; ci3++) {
+            var c3 = chs[ci3];
+            var bi3 = bIdxOf[ci3];
+            var t0, t1;
+            if (uRtl && a >= 0) {
+              /* RTL visual order left-to-right: logical char 0 sits at right end */
+              t1 = 1 - (bi3 / mBases);
+              t0 = 1 - ((bi3 + 1) / mBases);
+            } else {
+              t0 = bi3 / mBases;
+              t1 = (bi3 + 1) / mBases;
+            }
+            var sx0 = x + dxSpan * t0, sy0 = y + dySpan * t0;
+            var sx1 = x + dxSpan * t1, sy1 = y + dySpan * t1;
+            glyphs.push({
+              x0: Math.min(sx0, sx1), x1: Math.max(sx0, sx1),
+              u0: sx0, v0: sy0 + rise, u1: sx1, v1: sy1 + rise,
+              y: (sy0 + sy1) * 0.5 + rise, fs: effSize, ch: c3,
+              cut: false, rtl: isRtlCh(c3), dirRtl: isRtlDir(c3), dia: isDiacritic(c3), zw: (c3 === '\u200C'),
+              kernEm: (ci3 === 0 ? kernNext : 0), advEm: 0, sepCand: false, f: frag, fo: fkey
+            });
+          }
+        }
+        kernNext = 0;
+        x = ex; y = ey;
+      }
+      Tm[4] = x; Tm[5] = y;
+    }
+
+    for (var i = 0; i < fn.length; i++) {
+      var f = fn[i], aArgs = args[i];
+      switch (f) {
+        case OPS.save: gstack.push(snapshot()); break;
+        case OPS.restore: if (gstack.length) restore(gstack.pop()); break;
+        case OPS.beginText:
+          Tm = [1, 0, 0, 1, 0, 0]; Tlm = Tm.slice(); x = 0; y = 0; kernNext = 0;
+          frag++;                                   /* v7: new BT = new fragment */
+          break;
+        case OPS.setFont: if (aArgs && aArgs.length > 1) { size = aArgs[1]; fkey = aArgs[0]; } break;
+        case OPS.setTextMatrix:
+          frag++;                                   /* v7: reposition = new fragment */
+          setMat(aArgs && aArgs.length >= 6 ? [aArgs[0], aArgs[1], aArgs[2], aArgs[3], aArgs[4], aArgs[5]] : [1, 0, 0, 1, 0, 0]);
+          break;
+        case OPS.moveText:
+          if (Math.abs(aArgs[0]) > 0.2 * (size || 12) || Math.abs(aArgs[1]) > 0.2 * (size || 12)) frag++;
+          moveText(aArgs[0], aArgs[1]);
+          break;
+        case OPS.setLeadingMoveText:
+          if (Math.abs(aArgs[0]) > 0.2 * (size || 12) || Math.abs(aArgs[1]) > 0.2 * (size || 12)) frag++;
+          leading = -aArgs[1]; moveText(aArgs[0], aArgs[1]);
+          break;
+        case OPS.setLeading: leading = aArgs[0]; break;
+        case OPS.setCharSpacing: tc = aArgs[0]; break;
+        case OPS.setWordSpacing: tw = aArgs[0]; break;
+        case OPS.setHScale: tz = aArgs[0] > 5 ? aArgs[0] / 100 : aArgs[0]; break;
+        case OPS.setTextRise: rise = aArgs[0]; break;
+        case OPS.nextLine:
+          nextLine(); break;
+        case OPS.nextLineSetSpacingShowText:
+          tw = aArgs[0]; tc = aArgs[1]; nextLine(); showGlyphs(aArgs[2] || []); break;
+        case OPS.nextLineShowText: nextLine(); showGlyphs(aArgs ? aArgs[0] || [] : []); break;
+        case OPS.showText:
+        case OPS.showSpacedText:
+          showGlyphs(aArgs ? aArgs[0] || [] : []); break;
+      }
+    }
+
+    var clean = [];
+    for (var p = 0; p < glyphs.length; p++) {
+      var gg = glyphs[p];
+      gg.idx = clean.length;
+      clean.push(gg);
+    }
+    /* ZWNJ touching punctuation is a separator in any mode (v1.16) */
+    var PUNCT = '،؛:!؟.,;()«»"[]٪…';
+    for (var p2 = 0; p2 < clean.length; p2++) {
+      var gp = clean[p2];
+      if (gp.ch !== '\u200C') continue;
+      var prevG = p2 > 0 ? clean[p2 - 1] : null;
+      var nextG = p2 < clean.length - 1 ? clean[p2 + 1] : null;
+      if ((prevG && PUNCT.indexOf(prevG.ch) >= 0) || (nextG && PUNCT.indexOf(nextG.ch) >= 0)) {
+        gp.sep = true;
+      }
+    }
+    return clean;
+  }
+
+  /* ---------------- glyph stream → words (v7, fragment-based) -------------- */
+  var NONJOIN = { 0x0627: 1, 0x0622: 1, 0x0623: 1, 0x0625: 1, 0x0671: 1,
+                  0x062F: 1, 0x0630: 1, 0x0631: 1, 0x0632: 1, 0x0698: 1,
+                  0x0648: 1, 0x0621: 1, 0x0624: 1, 0x0629: 1,
+                  0xFE80: 1, 0xFE81: 1, 0xFE82: 1, 0xFE83: 1, 0xFE84: 1,
+                  0xFE85: 1, 0xFE86: 1, 0xFE87: 1, 0xFE88: 1, 0xFE8D: 1, 0xFE8E: 1,
+                  0xFE93: 1, 0xFE94: 1, 0xFEA9: 1, 0xFEAA: 1, 0xFEAB: 1, 0xFEAC: 1,
+                  0xFEAD: 1, 0xFEAE: 1, 0xFEAF: 1, 0xFEB0: 1, 0xFB8A: 1, 0xFB8B: 1,
+                  0xFEED: 1, 0xFEEE: 1 };
+  var P_END = '،؛!?.…؟';
+  var P_GUARD = '.:,،';
+  var P_CLOSE = '»)]}\u201D';
+  var P_OPEN = '«([{\u201C';
+  function nonJoinCh(ch) { return !!NONJOIN[cp(ch)]; }
+  function isLatinCh(ch) {
+    var c = cp(ch);
+    return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
+  }
+  function isLetterCh(ch) { return isRtlCh(ch) || isLatinCh(ch); }
+  function isDigitCh(ch) {
+    var c = cp(ch);
+    return (c >= 0x30 && c <= 0x39) || (c >= 0x0660 && c <= 0x0669) ||
+           (c >= 0x06F0 && c <= 0x06F9);
+  }
+  var MIRROR = { '(': ')', ')': '(', '[': ']', ']': '[', '{': '}', '}': '{',
+                 '\u00AB': '\u00BB', '\u00BB': '\u00AB' };
+  function isMirrorCh(ch) { return Object.prototype.hasOwnProperty.call(MIRROR, ch); }
+  function mirrorSwap(ch) { return Object.prototype.hasOwnProperty.call(MIRROR, ch) ? MIRROR[ch] : null; }
+
+  /* mirror-swap a glyph object copy (keeps geometry) */
+  function mirrored(g) {
+    var mc = mirrorSwap(g.ch);
+    if (!mc) return g;
+    return { x0: g.x0, x1: g.x1, y: g.y, fs: g.fs, ch: mc, cut: g.cut, rtl: g.rtl, dirRtl: g.dirRtl,
+             dia: g.dia, zw: g.zw, ghost: g.ghost, sen: g.sen, idx: g.idx,
+             kernEm: g.kernEm, advEm: g.advEm, sepCand: g.sepCand, f: g.f, sep: g.sep, fo: g.fo };
+  }
+
+  /* Attach diacritics to their base glyph BEFORE reversing so diacritics/hamza stay AFTER their base letter */
+  function extractBaseAndDia(seq) {
+    var bases = [], diaMap = [];
+    for (var i = 0; i < seq.length; i++) {
+      if (!seq[i].dia) {
+        bases.push(seq[i]);
+        diaMap.push([]);
+      }
+    }
+    if (!bases.length) return { bases: seq.slice(), diaMap: null };
+    for (var j = 0; j < seq.length; j++) {
+      var dg = seq[j];
+      if (!dg.dia) continue;
+      var dc = (dg.x0 + dg.x1) * 0.5;
+      var bestBi = -1, bestScore = 1e18;
+      for (var bi = 0; bi < bases.length; bi++) {
+        var bg = bases[bi];
+        if (bg.ghost || bg.sen || bg.zw || !bg.ch || bg.ch === ' ') continue;
+        var inside = (dc >= bg.x0 - 0.5 && dc <= bg.x1 + 0.5);
+        var bc = (bg.x0 + bg.x1) * 0.5;
+        var dist = Math.abs(dc - bc);
+        /* stream precedence bonus when overlapping */
+        var score = (inside ? 0 : 1000) + dist + (bg.idx < dg.idx ? 0 : 0.2);
+        if (score < bestScore) { bestScore = score; bestBi = bi; }
+      }
+      if (bestBi < 0) bestBi = 0;
+      diaMap[bestBi].push(dg);
+    }
+    return { bases: bases, diaMap: diaMap };
+  }
+
+  /* reverse an RTL sequence, re-reversing embedded LTR runs (including multi-word English phrases) */
+  function rtlSeqToReading(seq) {
+    var bd = extractBaseAndDia(seq);
+    var diaIndex = (bd.diaMap && typeof Map !== 'undefined') ? new Map() : null;
+    if (diaIndex) {
+      for (var di0 = 0; di0 < bd.bases.length; di0++) {
+        if (bd.diaMap[di0].length) diaIndex.set(bd.bases[di0], bd.diaMap[di0]);
+      }
+    }
+    var out = bd.bases.slice().reverse();
+    var n = out.length;
+    var i = 0;
+    while (i < n) {
+      if (isLtrCh(out[i].ch)) {
+        var e0 = i, e1 = i + 1;
+        /* Extend left across join-neutrals that belong to LTR (only if immediately preceded by LTR? scan right first) */
+        while (e0 > 0 && isJoinNeutral(out[e0 - 1].ch) && e0 - 2 >= 0 && isLtrCh(out[e0 - 2].ch)) e0--;
+        /* Extend right across spaces/ZWNJ/join-neutrals/brackets as long as another LTR glyph follows without intervening RTL letter */
+        while (e1 < n) {
+          if (isLtrCh(out[e1].ch)) { e1++; continue; }
+          var k = e1;
+          var okBridge = false;
+          while (k < n) {
+            var ck = out[k].ch;
+            if (isLtrCh(ck)) { okBridge = true; break; }
+            if (isRtlDir(ck)) break;
+            if (ck === ' ' || out[k].zw || out[k].sen || out[k].ghost || ck === '' || isJoinNeutral(ck) || isMirrorCh(ck)) {
+              k++;
+            } else break;
+          }
+          if (okBridge) { e1 = k + 1; continue; }
+          /* Trailing join-neutral followed by LTR already checked; stop */
+          break;
+        }
+        /* Include balanced enclosing parens without double-mirroring: in reversed array `out`,
+           `out[e0-1]` was the visual-right paren (CLOSE) and `out[e1]` was visual-left paren (OPEN) */
+        var doMirror = true;
+        if (e0 > 0 && e1 < n && isMirrorCh(out[e0 - 1].ch) && isMirrorCh(out[e1].ch)) {
+          var cl = out[e0 - 1].ch, op = out[e1].ch;
+          if ((P_CLOSE.indexOf(cl) >= 0 && MIRROR[cl] === op)) {
+            e0--; e1++; doMirror = false;
+          }
+        }
+        if (e1 - e0 > 1) {
+          var seg = out.slice(e0, e1).reverse();
+          if (doMirror) {
+            for (var q2 = 0; q2 < seg.length; q2++) seg[q2] = mirrored(seg[q2]);
+          }
+          for (var q2b = 0; q2b < seg.length; q2b++) out[e0 + q2b] = seg[q2b];
+        }
+        i = e1;
+        continue;
+      }
+      i++;
+    }
+    if (!diaIndex || !diaIndex.size) return out;
+    var res = [];
+    for (var ri = 0; ri < out.length; ri++) {
+      var bg2 = out[ri];
+      res.push(bg2);
+      var att = diaIndex.get(bg2);
+      if (att && att.length) {
+        att.sort(function (a, b) { return a.idx - b.idx; });
+        for (var ai = 0; ai < att.length; ai++) res.push(att[ai]);
+      }
+    }
+    return res;
+  }
+
+  /* reverse an LTR sequence's embedded RTL runs (including multi-word Persian phrases & RTL numbers). */
+  function ltrSeqToReading(seq) {
+    var out = seq.slice();
+    var n = out.length;
+    var i = 0;
+    while (i < n) {
+      if (isRtlDir(out[i].ch)) {
+        var r0 = i, r1 = i + 1;
+        while (r1 < n) {
+          if (isRtlDir(out[r1].ch)) { r1++; continue; }
+          var k = r1;
+          var okBridge = false;
+          while (k < n) {
+            var ck = out[k].ch;
+            if (isRtlDir(ck)) { okBridge = true; break; }
+            if (isLatinCh(ck)) break;
+            if (ck === ' ' || out[k].zw || out[k].sen || out[k].ghost || ck === '' || isDigitCh(ck) || isJoinNeutral(ck) || isMirrorCh(ck)) {
+              k++;
+            } else break;
+          }
+          if (okBridge) { r1 = k + 1; continue; }
+          break;
+        }
+        if (r1 - r0 > 1) {
+          var rtlFixed = rtlSeqToReading(out.slice(r0, r1));
+          for (var q2 = 0; q2 < rtlFixed.length; q2++) out[r0 + q2] = rtlFixed[q2];
+        }
+        i = r1;
+        continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  /* per-fragment reading sequence.
+     items are ALWAYS visual L->R (x-sorted). */
+  function fragmentReadingSequence(items, fragRtl, streamVisual, rtlLine) {
+    if (fragRtl) {
+      /* RTL content: visual L->R -> RTL reading order (embedded LTR runs re-reversed) */
+      return rtlSeqToReading(items);
+    }
+    /* LTR content */
+    if (!rtlLine) {
+      return ltrSeqToReading(items);
+    }
+    /* LTR fragment inside an RTL line */
+    var digits = 0, letters = 0;
+    for (var i = 0; i < items.length; i++) {
+      var c = items[i].ch;
+      if (c === '') continue;
+      if (isDigitCh(c)) digits++;
+      else if (isLatinCh(c)) letters++;
+    }
+    var seq;
+    if (digits > 0 && digits >= letters) {
+      /* Move ONLY trailing list/sentence punctuation stuck on visual left (e.g. '.1' -> '1.'),
+         never opening parens '(' or signs '-' / '+' / '$' ('(2025)', '-5'). */
+      seq = items.slice();
+      var lead = [];
+      var TRAIL_NUM_PUNCT = '.:،؛!?؟';
+      while (seq.length && seq[0].ch && TRAIL_NUM_PUNCT.indexOf(seq[0].ch) >= 0) {
+        lead.push(seq.shift());
+      }
+      seq = seq.concat(lead);
+    } else {
+      seq = items.slice();
+    }
+    var out = [];
+    for (var k = 0; k < seq.length; k++) {
+      var g2 = seq[k];
+      if (isMirrorCh(g2.ch)) {
+        var prevCh = k > 0 ? seq[k - 1].ch : '';
+        var nextCh = k < seq.length - 1 ? seq[k + 1].ch : '';
+        /* Swap ONLY if brackets look inverted relative to neighbors */
+        if (isLatinCh(prevCh) || isLatinCh(nextCh) || isDigitCh(prevCh) || isDigitCh(nextCh)) {
+          if ((k === 0 && P_CLOSE.indexOf(g2.ch) >= 0) || (k === seq.length - 1 && P_OPEN.indexOf(g2.ch) >= 0)) {
+            out.push(mirrored(g2));
+            continue;
+          }
+        }
+      }
+      out.push(g2);
+    }
+    return out;
+  }
+
+  /* nearest font-size estimate for a line's items */
+  function fsApprox(items) {
+    var mx = 8;
+    for (var i = 0; i < items.length; i++) if (items[i].fs > mx && items[i].fs < 200) mx = items[i].fs;
+    return mx;
+  }
+
+  /* the letter at a fragment's READING edge.
+     first=true  → the FIRST real letter in reading order
+     first=false → the LAST real letter in reading order
+     items are x-sorted (visual). For RTL content the reading-first is the
+     rightmost real letter; the helper scans both ways and picks by the
+     fragment's own direction. For neutral-only fragments returns null. */
+  function readingEdgeLetter(items, first) {
+    var reals = [];
+    for (var i = 0; i < items.length; i++) {
+      var g = items[i];
+      if (g.ghost || g.sen || g.dia || g.zw || g.ch === ' ' || !g.ch) continue;
+      reals.push(g);
+    }
+    if (!reals.length) return null;
+    var anyRtl = false;
+    for (var k = 0; k < reals.length; k++) if (reals[k].dirRtl) { anyRtl = true; break; }
+    if (anyRtl) {
+      /* RTL content: reading runs right-to-left */
+      return first ? reals[reals.length - 1].ch : reals[0].ch;
+    }
+    return first ? reals[0].ch : reals[reals.length - 1].ch;
+  }
+
+  /* script vote helper: only Arabic/Latin LETTERS vote for direction —
+     digits, marks and punctuation abstain (v7: «سال ۱۴۰۵» was classified
+     LTR because its 4 digits outvoted 3 Persian letters in the total;
+     «۲۰٪» was RTL-classified by its Arabic PERCENT SIGN). */
+  var AR_SCRIPT_PUNCT = { 0x060C: 1, 0x061B: 1, 0x061F: 1, 0x066A: 1, 0x066B: 1,
+                          0x066C: 1, 0x066D: 1, 0x06D4: 1 };
+  function isArabicLetterCh(ch) {
+    var c = cp(ch);
+    return isRtlDir(ch) && !AR_SCRIPT_PUNCT[c];
+  }
+  function isScriptCh(ch) { return isArabicLetterCh(ch) || isLatinCh(ch); }
+
+  function visCmp(a, b) {
+    return (((a.x0 + a.x1) - (b.x0 + b.x1)) * 0.5) || (a.x0 - b.x0) || (a.idx - b.idx);
+  }
+
+  function glyphsToWords(glyphs, pageH) {
+    var ink = glyphs.filter(function (g) { return g.ch !== '' || g.ghost || g.sen; });
+    if (!ink.length) return [];
+    if (pageH > 0) for (var f = 0; f < ink.length; f++) ink[f].y = pageH - ink[f].y;
+
+    /* 1) line clustering: cluster base glyphs first, then attach diacritics to nearest line */
+    var baseInk = [], diaInk = [];
+    for (var b0 = 0; b0 < ink.length; b0++) {
+      if (ink[b0].dia) diaInk.push(ink[b0]); else baseInk.push(ink[b0]);
+    }
+    var lines = [], cur = null;
+    if (baseInk.length) {
+      baseInk.sort(function (a, b) { return a.y - b.y || a.x0 - b.x0; });
+      for (var i = 0; i < baseInk.length; i++) {
+        var g = baseInk[i];
+        if (!cur || Math.abs(g.y - cur.y) > Math.max(2.2, Math.max(g.fs, cur.fsSeen) * 0.45)) {
+          cur = { y: g.y, items: [], fsSeen: g.fs || 10, xMin: g.x0, xMax: g.x1 };
+          lines.push(cur);
+        }
+        cur.items.push(g);
+        if (g.fs > cur.fsSeen && g.fs < 200) cur.fsSeen = g.fs;
+        if (g.x0 < cur.xMin) cur.xMin = g.x0;
+        if (g.x1 > cur.xMax) cur.xMax = g.x1;
+      }
+      for (var di1 = 0; di1 < diaInk.length; di1++) {
+        var dg = diaInk[di1], bestL = null, bestDy = 1e9;
+        for (var li0 = 0; li0 < lines.length; li0++) {
+          var ln0 = lines[li0];
+          var dy = Math.abs(dg.y - ln0.y);
+          if (dy < ln0.fsSeen * 1.6 && dg.x1 >= ln0.xMin - ln0.fsSeen && dg.x0 <= ln0.xMax + ln0.fsSeen) {
+            if (dy < bestDy) { bestDy = dy; bestL = ln0; }
+          }
+        }
+        if (!bestL) {
+          bestDy = 1e9;
+          for (var li1 = 0; li1 < lines.length; li1++) {
+            var dy1 = Math.abs(dg.y - lines[li1].y);
+            if (dy1 < bestDy) { bestDy = dy1; bestL = lines[li1]; }
+          }
+        }
+        if (bestL) bestL.items.push(dg);
+      }
+    } else if (diaInk.length) {
+      diaInk.sort(function (a, b) { return a.y - b.y || a.x0 - b.x0; });
+      lines.push({ y: diaInk[0].y, items: diaInk.slice(), fsSeen: diaInk[0].fs || 10 });
+    }
+
+    /* v1.41: PHANTOM SPACE detection (Word/PPT bidi artifacts) */
+    for (var pl = 0; pl < lines.length; pl++) {
+      var plItems = lines[pl].items;
+      var plReal = [];
+      for (var pq = 0; pq < plItems.length; pq++) {
+        var pg = plItems[pq];
+        if (pg.ch === ' ' || pg.ch === '' || pg.ghost || pg.sen || pg.dia) continue;
+        plReal.push(pg);
+      }
+      plReal.sort(function (a, b) { return a.x0 - b.x0; });
+      var plStream = plItems.slice().sort(function (a, b) { return a.idx - b.idx; });
+      for (var ps = 0; ps < plStream.length; ps++) {
+        var sp = plStream[ps];
+        var isSpc = sp.ch === ' ';
+        var isSen = sp.ch === '' && sp.sen;
+        var isZwj = sp.ch === '\u200C' && sp.zw;
+        if (isZwj && ((sp.advEm || 0) >= 0.12 || sp.sep)) { sp.cut = true; sp.sen = false; continue; }
+        if (!isSpc && !isSen && !isZwj) continue;
+        if (isSen && !sp.cut) continue;
+        var sc = (sp.x0 + sp.x1) / 2;
+        var sfs = Math.max(sp.fs || 10, 10);
+        var cluster = false;
+        for (var po = 0; po < plStream.length; po++) {
+          if (po === ps) continue;
+          var so = plStream[po];
+          if (so.ch === ' ' && Math.abs((so.x0 + so.x1) / 2 - sc) < 0.25) { cluster = true; break; }
+        }
+        if (cluster) { sp.ph = true; continue; }
+        var canceled = false;
+        for (var pt = ps + 1; pt < plStream.length; pt++) {
+          var st = plStream[pt];
+          if (st.ghost || st.sen || st.ch === '') continue;
+          if (st.ch === ' ') { if (Math.abs((st.x0 + st.x1) / 2 - sc) > 1) break; continue; }
+          if (Math.abs(st.x0 - sc) < 0.04 * sfs && st.x1 > sc + 0.05 * sfs) canceled = true;
+          break;
+        }
+        if (canceled) { sp.ph = true; continue; }
+        /* Deeply buried inside ink (>0.09em from both glyph edges) */
+        var cover = null;
+        for (var pr = 0; pr < plReal.length; pr++) {
+          var rg = plReal[pr];
+          if (rg.x0 + 0.09 * sfs < sc && sc < rg.x1 - 0.09 * sfs) { cover = rg; break; }
+        }
+        var nearHole = false, snapX = null;
+        for (var pr2 = 0; pr2 + 1 < plReal.length; pr2++) {
+          var gL = plReal[pr2], gR = plReal[pr2 + 1];
+          var holeL = gL.x1, holeR = gR.x0;
+          if (holeR - holeL < 0.04 * sfs) continue;
+          if (Math.abs(holeL - sc) <= 0.15 * sfs || Math.abs(holeR - sc) <= 0.15 * sfs) {
+            nearHole = true; snapX = (holeL + holeR) / 2; break;
+          }
+        }
+        if (nearHole) {
+          if (snapX != null) { sp.x0 = snapX; sp.x1 = snapX; }
+          continue;
+        }
+        if (cover) {
+          sp.ph = true;
+          sp.sen = false; sp.cut = false; sp.ghost = true;
+          continue;
+        }
+      }
+    }
+
+    /* 2) page direction — script-letter votes only (v7) */
+    var rtlN = 0, tot = 0;
+    for (var j = 0; j < ink.length; j++) {
+      var gj = ink[j];
+      if (gj.ghost || gj.sen || gj.dia || gj.zw || gj.ch === ' ') continue;
+      if (!isScriptCh(gj.ch)) continue;
+      tot++; if (gj.dirRtl) rtlN++;
+    }
+    var pageRtl = rtlN * 2 > tot;
+
+    /* 3) modal thresholds over the whole page (v6 pair-aware) */
+    var connG = [], discG = [];
+    for (var L = 0; L < lines.length; L++) {
+      var itsL = lines[L].items.slice().sort(function (a, b) { return a.x0 - b.x0; });
+      for (var m = 1; m < itsL.length; m++) {
+        var A = itsL[m - 1], B = itsL[m];
+        if (A.ghost || B.ghost || A.zw || B.zw || A.sen || B.sen || A.ch === ' ' || B.ch === ' ') continue;
+        var gapR = B.x0 - A.x1;
+        if (gapR <= 0.01) continue;
+        var r = gapR / Math.max(A.fs, B.fs);
+        if (r > 0.45) continue;
+        if (nonJoinCh(A.ch) || nonJoinCh(B.ch)) discG.push(r); else connG.push(r);
+      }
+    }
+    function modalGap(arr, lo, hi, step, def) {
+      if (arr.length < 5) return def;
+      var bins = {}, best = -1, bestC = 0;
+      for (var i2 = 0; i2 < arr.length; i2++) {
+        var v = arr[i2];
+        if (v < lo || v > hi) continue;
+        var bk = Math.round(v / step);
+        bins[bk] = (bins[bk] || 0) + 1;
+        if (bins[bk] > bestC) { bestC = bins[bk]; best = bk; }
+      }
+      return (best >= 0 && bestC >= 3) ? (best + 0.5) * step : def;
+    }
+    var Dmodal = modalGap(discG, 0.0, 0.15, 0.01, 0.082);
+    /* v7 FIX #5: Cmodal must be computed BEFORE the wordJust gate —
+       v6.7 used it before its `var` declaration (undefined → gate off) */
+    var Cmodal = modalGap(connG, 0.0, 0.12, 0.01, 0.016);
+    var wordJust = (Cmodal >= 0.035) || (Dmodal >= 0.035);
+    var Dp95 = (discG.length >= 8)
+      ? discG.slice().sort(function (a, b) { return a - b; })[Math.floor(discG.length * 0.95)]
+      : 0.082;
+    var Td = wordJust
+      ? Math.max(0.06, Math.min(0.20, Dmodal + 0.02))
+      : Math.max(0.10, Math.min(0.22, Dp95 + 0.02));
+    var Tc = Math.max(0.05, Math.min(0.13, Cmodal + 0.04));
+
+    /* v7: MARKER-RICH page detection. Producers that mark every word
+       space explicitly (space glyphs, ≥0.12em kern sentinels, cut ZWNJs)
+       do not need — and are HARMED by — geometric pair cuts: the modal
+       thresholds fire on intra-word non-joiner gaps and shatter words
+       («تع یی ن», «مر ی ض ی» on the book corpus). When ≥1 marker exists
+       per ~8 real glyphs, spaces are explicit; geometric cuts off.
+       v1.41: phantom spaces no longer count as markers. */
+    var markerCount = 0, realGlyphs = 0;
+    for (var mk = 0; mk < ink.length; mk++) {
+      var gm = ink[mk];
+      if (gm.sen || (gm.ch === ' ' && !gm.ph) || (gm.zw && gm.cut)) { markerCount++; continue; }
+      if (!gm.ghost && !gm.dia && gm.ch !== '') realGlyphs++;
+    }
+    var geoCutsOn = !(markerCount >= 1 && realGlyphs > 0 && markerCount / Math.max(1, realGlyphs) >= 0.12);
+
+    var words = [];
+    for (var L2 = 0; L2 < lines.length; L2++) {
+      var lineItems = lines[L2].items;
+      if (!lineItems.length) continue;
+
+      /* --- v7: group into fragments --------------------------------- */
+      var fragMap = {}, fragOrder = [];
+      for (var q1 = 0; q1 < lineItems.length; q1++) {
+        var gid = lineItems[q1].f | 0;
+        if (!(gid in fragMap)) { fragMap[gid] = []; fragOrder.push(gid); }
+        fragMap[gid].push(lineItems[q1]);
+      }
+      var frags = [];
+      for (var q2 = 0; q2 < fragOrder.length; q2++) {
+        var items = fragMap[fragOrder[q2]];
+        items.sort(visCmp);
+        var fx0 = 1e9, fx1 = -1e9, hasReal = false, inkN = 0;
+        for (var q3 = 0; q3 < items.length; q3++) {
+          if (!items[q3].ghost && !items[q3].sen && items[q3].ch !== ' ') hasReal = true;
+          if (items[q3].ghost || items[q3].sen || items[q3].ch === '' || items[q3].ch === ' ') continue;
+          if (items[q3].x0 < fx0) fx0 = items[q3].x0;
+          if (items[q3].x1 > fx1) fx1 = items[q3].x1;
+          inkN++;
+        }
+        if (inkN === 0) {
+          for (var q3b = 0; q3b < items.length; q3b++) {
+            if (items[q3b].x0 < fx0) fx0 = items[q3b].x0;
+            if (items[q3b].x1 > fx1) fx1 = items[q3b].x1;
+          }
+        }
+        frags.push({ id: fragOrder[q2], items: items, x0: fx0, x1: fx1, cx: (fx0 + fx1) / 2, real: hasReal });
+      }
+      var realFrags = [];
+      for (var q4 = 0; q4 < frags.length; q4++) {
+        if (frags[q4].real) realFrags.push(frags[q4]);
+      }
+      if (realFrags.length) {
+        for (var q5 = 0; q5 < frags.length; q5++) {
+          if (frags[q5].real) continue;
+          var bestF = null, bestD = 1e18;
+          for (var q6 = 0; q6 < realFrags.length; q6++) {
+            var rf = realFrags[q6];
+            for (var q6b = 0; q6b < rf.items.length; q6b++) {
+              var rg = rf.items[q6b];
+              if (!rg.ch) continue;
+              var d3 = Math.abs(frags[q5].cx - (rg.x0 + rg.x1) / 2);
+              if (d3 < bestD) { bestD = d3; bestF = rf; }
+            }
+          }
+          if (bestF) {
+            for (var q7 = 0; q7 < frags[q5].items.length; q7++) bestF.items.push(frags[q5].items[q7]);
+          }
+        }
+        frags = realFrags;
+        for (var q8 = 0; q8 < frags.length; q8++) {
+          frags[q8].items.sort(visCmp);
+          var nfx0 = 1e9, nfx1 = -1e9, nInk = 0;
+          for (var q8b = 0; q8b < frags[q8].items.length; q8b++) {
+            var ng8 = frags[q8].items[q8b];
+            if (ng8.ghost || ng8.sen || ng8.ch === '' || ng8.ch === ' ') continue;
+            if (ng8.x0 < nfx0) nfx0 = ng8.x0;
+            if (ng8.x1 > nfx1) nfx1 = ng8.x1;
+            nInk++;
+          }
+          if (nInk === 0) for (var q8c = 0; q8c < frags[q8].items.length; q8c++) {
+            if (frags[q8].items[q8c].x0 < nfx0) nfx0 = frags[q8].items[q8c].x0;
+            if (frags[q8].items[q8c].x1 > nfx1) nfx1 = frags[q8].items[q8c].x1;
+          }
+          frags[q8].x0 = nfx0; frags[q8].x1 = nfx1; frags[q8].cx = (nfx0 + nfx1) / 2;
+        }
+      }
+
+      /* --- line direction — v1.43: bilingual lines follow the PAGE ----
+         Letter-count voting broke every mixed Persian/English line:
+         «Induction of Labor اندکشن لیبر» has 17 Latin vs 10 Persian
+         letters, flipped LTR, and emitted the whole line in reversed
+         (visual) order; «(Elective Induction) انتخابی اندکشن 12» ditto.
+         Rule now: both scripts present → page direction (mixed lines read
+         in the document's direction; embedded LTR runs keep their own
+         internal order, so rendering stays correct); single script → that
+         script; digits/neutral never vote. */
+      var lnRtlN = 0, lnLtrN = 0;
+      var firstStrongX = 1e18, lastStrongX = -1e18, firstStrongRtl = null, lastStrongRtl = null;
+      for (var q9 = 0; q9 < lineItems.length; q9++) {
+        var lq = lineItems[q9];
+        if (lq.ghost || lq.sen || lq.dia || lq.ch === ' ' || lq.zw) continue;
+        var isArL = isArabicLetterCh(lq.ch), isLaL = isLatinCh(lq.ch);
+        if (isArL) lnRtlN++;
+        else if (isLaL) lnLtrN++;
+        if (isArL || isLaL) {
+          var lcx = (lq.x0 + lq.x1) * 0.5;
+          if (lcx < firstStrongX) { firstStrongX = lcx; firstStrongRtl = isArL; }
+          if (lcx > lastStrongX) { lastStrongX = lcx; lastStrongRtl = isArL; }
+        }
+      }
+      var rtlLine = pageRtl;
+      if (lnRtlN > 0 && lnLtrN > 0) {
+        if (firstStrongRtl !== null && firstStrongRtl === lastStrongRtl && (tot < 80 || Math.max(rtlN, tot - rtlN) * 10 < tot * 7)) {
+          rtlLine = firstStrongRtl;
+        }
+      } else if (lnRtlN > 0) {
+        rtlLine = true;
+      } else if (lnLtrN > 0) {
+        rtlLine = false;
+      }
+
+      /* --- v7: fragment ordering — units + direction islands -------------
+         1. classify each fragment (RTL content / other)
+         2. group x-adjacent same-class fragments into ISLANDS — an LTR
+            number/Latin cluster inside an RTL line («۱۶-۲۰٪», "1.5") is
+            drawn as SEPARATE Tm fragments but reads as ONE left-to-right
+            block; sorting those fragments individually by x-center
+            scrambles them («٪۲۰ - ۱۶"). An island orders internally by
+            its own direction and occupies its full extent in the line.
+         3. order units by the LINE's reading direction: RTL line → by
+            right edge DESC; LTR line → by left edge ASC. */
+      for (var qc0 = 0; qc0 < frags.length; qc0++) {
+        var fq = frags[qc0];
+        var fR = 0, fT = 0;
+        for (var qc1 = 0; qc1 < fq.items.length; qc1++) {
+          var gg2 = fq.items[qc1];
+          if (gg2.ghost || gg2.sen || gg2.dia || gg2.ch === ' ' || gg2.zw) continue;
+          if (!isScriptCh(gg2.ch)) continue;
+          fT++; if (gg2.dirRtl) fR++;
+        }
+        var fL = fT - fR;
+        fq.rtlContent = (fR > 0 && fL > 0) ? rtlLine : (fR > 0);
+        /* v1.43: a fragment that is ONLY bracket punctuation (no letters,
+           no digits) used to default rtlContent=false and glued into LTR
+           islands — parens surfaced on the wrong side of the Latin run
+           («E2) (دینوپروستون»). Bracket-only fragments now follow the
+           LINE's direction so positional sort places them exactly where
+           they were drawn. Digits/bullets keep the old LTR-island path
+           (the calibrated «۱۶-۲۰٪» cluster behavior). */
+        if (fT === 0) {
+          var onlyBracket = false, otherInk = false;
+          for (var qb = 0; qb < fq.items.length; qb++) {
+            var bc = fq.items[qb].ch;
+            if (bc === '' || bc === ' ' || fq.items[qb].ghost || fq.items[qb].sen) continue;
+            if (isMirrorCh(bc)) onlyBracket = true;
+            else otherInk = true;
+          }
+          if (onlyBracket && !otherInk) fq.rtlContent = rtlLine;
+        }
+      }
+      /* guard — RUN-BASED fragment merging for glyph-per-fragment producers:
+         the book draws Arabic words letter-by-letter (measured 1.1–1.8 real
+         glyphs per fragment) — such runs carry no word boundaries and the
+         per-fragment separators shatter words («تع|یی|ن»). A maximal run of
+         same-direction fragments averaging < 2.2 real glyphs is merged into
+         ONE fragment; whole-word fragment producers (PowerPoint corpus:
+         3.3–11 glyphs/fragment) never hit the threshold. Latin words inside
+         RTL lines keep their own fragments (different class → separate runs). */
+      var realCount = 0;
+      for (var qa = 0; qa < frags.length; qa++) {
+        for (var qb = 0; qb < frags[qa].items.length; qb++) {
+          var gi = frags[qa].items[qb];
+          if (!gi.ghost && !gi.sen && gi.ch !== ' ') realCount++;
+        }
+      }
+      if (frags.length > 1 && realCount / frags.length < 2.2) {
+        /* whole line is glyph-per-fragment — merge everything */
+        var all = [];
+        for (var qc = 0; qc < frags.length; qc++) all = all.concat(frags[qc].items);
+        all.sort(function (a, b) { return (a.x0 - b.x0) || (a.idx - b.idx); });
+        frags = [{ id: -1, items: all, x0: -1e9, x1: 1e9, cx: 0, real: true, rtlContent: rtlLine }];
+      } else {
+        /* run-based merge of tiny same-class fragment runs */
+        frags.sort(function (a, b) { return a.x0 - b.x0; });
+        var merged = [];
+        var run = [];
+        var runRtl = null;
+        var runReal = 0;
+        function closeRun() {
+          /* only merge runs whose members all carry real letters/digits —
+             a lone bullet/paren/percent fragment (pure punctuation) must
+             stay its own unit («۱۶-۲۰ ٪•» glue bug) */
+          var eligible = run.length > 1 && runReal / run.length < 2.2;
+          if (eligible) {
+            for (var rr = 0; rr < run.length; rr++) {
+              var hasAlnum = false;
+              for (var rr2 = 0; rr2 < run[rr].items.length; rr2++) {
+                var rc = run[rr].items[rr2].ch;
+                if (rc && (isDigitCh(rc) || isLatinCh(rc) || isArabicLetterCh(rc))) { hasAlnum = true; break; }
+              }
+              if (!hasAlnum) { eligible = false; break; }
+            }
+          }
+          /* v1.43: CONTIGUITY — the tiny-run merge glued fragments that
+             were 50pt apart (two «هٔ» marks around a whole word) into one
+             wide phantom fragment that destroyed line order
+             («بیشاپهٔهٔ»). A run only merges when consecutive members are
+             geometrically adjacent (ink gap ≤ 0.45em). */
+          if (eligible && run.length > 1) {
+            var fsRun = Math.max(8, fsApprox(lineItems));
+            for (var rgap = 1; rgap < run.length; rgap++) {
+              if (run[rgap].x0 - run[rgap - 1].x1 > 0.45 * fsRun) { eligible = false; break; }
+            }
+          }
+          if (eligible) {
+            var its = [];
+            var rx0 = 1e9, rx1 = -1e9;
+            for (var r2 = 0; r2 < run.length; r2++) {
+              its = its.concat(run[r2].items);
+              rx0 = Math.min(rx0, run[r2].x0);
+              rx1 = Math.max(rx1, run[r2].x1);
+            }
+            its.sort(function (a, b) { return (a.x0 - b.x0) || (a.idx - b.idx); });
+            merged.push({ id: run[0].id, items: its, x0: rx0, x1: rx1, cx: (rx0 + rx1) / 2, real: true, rtlContent: runRtl });
+          } else {
+            for (var r3 = 0; r3 < run.length; r3++) merged.push(run[r3]);
+          }
+          run = []; runReal = 0;
+        }
+        for (var qz = 0; qz < frags.length; qz++) {
+          var fr2 = frags[qz];
+          var frReal = 0;
+          for (var qz2 = 0; qz2 < fr2.items.length; qz2++) {
+            var gi2 = fr2.items[qz2];
+            if (!gi2.ghost && !gi2.sen && gi2.ch !== ' ') frReal++;
+          }
+          if (runRtl !== null && fr2.rtlContent !== runRtl) closeRun();
+          runRtl = fr2.rtlContent;
+          run.push(fr2);
+          runReal += frReal;
+        }
+        closeRun();
+        frags = merged;
+      }
+
+      /* island grouping: walk fragments in x order; same-class neighbors
+         with a small gap merge into one unit */
+      frags.sort(function (a, b) { return a.x0 - b.x0; });
+      var units = [];
+      for (var qz = 0; qz < frags.length; qz++) {
+        var fr2 = frags[qz];
+        var lastU = units.length ? units[units.length - 1] : null;
+        if (lastU && lastU.rtlContent === fr2.rtlContent) {
+          var gapU = fr2.x0 - lastU.x1;
+          var fsU = Math.max(8, fsApprox(lineItems));
+          /* v1.43: LTR neighbours merge across a full word space — English
+             phrases inside RTL lines are justified (measured inter-word
+             gaps 0.45em on the Word corpus); at 0.35em the phrase split
+             into per-word units which the RTL unit-sort then reversed
+             («Tubules|Seminiferous» → «TubulesSeminiferous»). RTL-RTL
+             keeps the calibrated tight threshold. */
+          var gapLim = fr2.rtlContent ? 0.35 * fsU : 1.2 * fsU;
+          if (gapU < gapLim) {   /* near-contiguous */
+            lastU.frags.push(fr2);
+            lastU.x0 = Math.min(lastU.x0, fr2.x0);
+            lastU.x1 = Math.max(lastU.x1, fr2.x1);
+            continue;
+          }
+        }
+        units.push({ rtlContent: fr2.rtlContent, frags: [fr2], x0: fr2.x0, x1: fr2.x1 });
+      }
+      /* unit reading order + internal fragment order.
+         v1.41: bidi-interleaved fragments (overlapping boxes ≥25% of the
+         smaller) are ordered by their CONTENT-STREAM position on marker-
+         rich pages — x-ordering is noise there (measured: خ vs ص of خصیه
+         overlapped 92% and x1 flipped the reading order). */
+      function fragMinIdx(f) {
+        var mn = 1e18;
+        var src = f.items ? [f] : (f.frags || []);
+        for (var qi = 0; qi < src.length; qi++) {
+          var one = src[qi];
+          var its = one.items || [];
+          for (var qj = 0; qj < its.length; qj++) {
+            if (its[qj].idx < mn) mn = its[qj].idx;
+          }
+        }
+        return mn === 1e18 ? 0 : mn;
+      }
+      function boxOverlapF(a, b) {
+        var lo = Math.max(a.x0, b.x0), hi = Math.min(a.x1, b.x1);
+        if (hi <= lo) return 0;
+        var mw = Math.min(a.x1 - a.x0, b.x1 - b.x0);
+        return mw > 0 ? (hi - lo) / mw : 0;
+      }
+      var orderOverlapByStream = !geoCutsOn;
+      function orderFrags(a, b) {
+        if (orderOverlapByStream && boxOverlapF(a, b) > 0.25) {
+          return fragMinIdx(a) - fragMinIdx(b);
+        }
+        return rtlLine ? (b.x1 - a.x1) : (a.x0 - b.x0);
+      }
+      for (var qy = 0; qy < units.length; qy++) {
+        var u = units[qy];
+        if (u.rtlContent) u.frags.sort(function (a, b) {
+          if (orderOverlapByStream && boxOverlapF(a, b) > 0.25) return fragMinIdx(a) - fragMinIdx(b);
+          return b.x1 - a.x1;                                        /* RTL: rightmost first */
+        });
+        else u.frags.sort(function (a, b) {
+          if (orderOverlapByStream && boxOverlapF(a, b) > 0.25) return fragMinIdx(a) - fragMinIdx(b);
+          return a.x0 - b.x0;                                        /* LTR: leftmost first */
+        });
+      }
+      units.sort(orderFrags);
+      /* v1.42 (B): POSITIONAL CONSISTENCY — producers that write one
+         marks-run (spaces+parens) spanning the whole line while the
+         letters nest inside it (LibreOffice RTL) make every fragment
+         ordering contradictory: a unit's box contains other units'
+         words. If reading order by position contradicts the unit order,
+         rebuild the line as ONE fragment and let the marker + pair-cut
+         rules split the words (the book-corpus path).
+         v1.43 GATE: only for lines with NO Latin-letter islands — a mixed
+         bilingual line reads correctly as units, and flattening it into
+         one mega fragment reverses the embedded English runs
+         («IsBleomycinWhen», «TubulesSeminiferous» on the Word corpus). */
+      var megaHasLatin = false;
+      for (var pg0 = 0; pg0 < units.length && !megaHasLatin; pg0++) {
+        if (units[pg0].rtlContent) continue;
+        for (var pg1 = 0; pg1 < units[pg0].frags.length && !megaHasLatin; pg1++) {
+          var pgItems = units[pg0].frags[pg1].items || [];
+          for (var pg2 = 0; pg2 < pgItems.length; pg2++) {
+            var pgc = pgItems[pg2].ch;
+            if (pgc && isLatinCh(pgc) && !isDigitCh(pgc)) { megaHasLatin = true; break; }
+          }
+        }
+      }
+      if (units.length > 1) {
+        var posTol = 2;
+        var posOK = true;
+        for (var pu = 1; pu < units.length; pu++) {
+          if (rtlLine ? (units[pu].x1 > units[pu - 1].x1 - posTol)
+                      : (units[pu].x0 < units[pu - 1].x0 + posTol)) { posOK = false; break; }
+        }
+        if (!posOK && !megaHasLatin) {
+          var mega = [];
+          for (var pm = 0; pm < units.length; pm++)
+            for (var pm2 = 0; pm2 < units[pm].frags.length; pm2++)
+              mega = mega.concat(units[pm].frags[pm2].items);
+          mega.sort(function (a, b) { return (a.x0 - b.x0) || (a.idx - b.idx); });
+          frags = [{ id: -2, items: mega, x0: -1e9, x1: 1e9, cx: 0, real: true,
+                     rtlContent: rtlLine, mega: true }];
+          units = [{ rtlContent: rtlLine, frags: frags.slice(), x0: -1e9, x1: 1e9 }];
+        }
+      }
+      /* flatten units back into a fragment list in READING order */
+      var ordered = [];
+      for (var qx = 0; qx < units.length; qx++) {
+        for (var qw = 0; qw < units[qx].frags.length; qw++) ordered.push(units[qx].frags[qw]);
+      }
+      frags = ordered;
+
+      /* --- per line: pair cuts at LINE level (v7: geometric/ZWNJ rules
+             cross fragment boundaries — e.g. a ZWNJ at a fragment edge
+             needs its hole measured against the NEIGHBOUR fragment's glyphs),
+             then per-fragment assembly ------------------------------ */
+      var fsLine = 0;
+      for (var qd = 0; qd < lineItems.length; qd++) fsLine = Math.max(fsLine, lineItems[qd].fs);
+      var yTop = lines[L2].y - fsLine * 0.95, yBot = lines[L2].y + fsLine * 0.30;
+      var lineStartW = words.length;
+
+      /* line-level stream direction: MUST inspect items in stream (idx) order, NOT x-sorted */
+      var lvN = 0, llN = 0;
+      var visLine = lineItems.slice().sort(visCmp);
+      var idxLine = lineItems.slice().sort(function (a, b) { return a.idx - b.idx; });
+      for (var lv = 1; lv < idxLine.length; lv++) {
+        if (idxLine[lv].ghost || idxLine[lv - 1].ghost) continue;
+        if (idxLine[lv].x0 > idxLine[lv - 1].x0 + 0.1) lvN++;
+        else if (idxLine[lv].x0 < idxLine[lv - 1].x0 - 0.1) llN++;
+      }
+      var lineStreamVisual = lvN >= llN;
+      for (var ufi = 0; ufi < frags.length; ufi++) {
+        var ufitems = frags[ufi].items;
+        for (var ufk = 0; ufk < ufitems.length; ufk++) ufitems[ufk]._uf = ufi;
+      }
+      applyPairCuts(visLine, rtlLine, lineStreamVisual, Tc, Td, geoCutsOn);
+
+      for (var fi = 0; fi < frags.length; fi++) {
+        var fr = frags[fi];
+        var items2 = fr.items;
+
+        var fragSep = false;
+        if (fi > 0) {
+          var prev = frags[fi - 1];
+          var gapF;
+          if (fr.rtlContent && prev.rtlContent) gapF = prev.x0 - fr.x1;
+          else if (!fr.rtlContent && !prev.rtlContent) gapF = Math.max(fr.x0 - prev.x1, prev.x0 - fr.x1);
+          else gapF = fr.x0 - prev.x1;
+          var fsRef = Math.max(fsLine, 8);
+          var joinable = false;
+          if (prev.rtlContent && fr.rtlContent) {
+            var zLo = Math.min(prev.x0, fr.x1) - 1.5, zHi = Math.max(prev.x0, fr.x1) + 1.5;
+            var marker = false;
+            var checkItems = prev.items.concat(fr.items);
+            for (var mi = 0; mi < checkItems.length; mi++) {
+              var mg = checkItems[mi];
+              if (mg.ph || !(mg.zw || mg.sen || mg.ghost || mg.ch === ' ')) continue;
+              if (mg.x1 >= zLo && mg.x0 <= zHi) { marker = true; break; }
+            }
+            if (!marker) {
+              if (Math.abs(gapF) < 0.02 * fsRef) {
+                joinable = true;
+              } else if (gapF < 0) {
+                var aCh = readingEdgeLetter(prev.items, false);
+                var bCh = readingEdgeLetter(fr.items, true);
+                if (aCh && bCh && !nonJoinCh(aCh) && !nonJoinCh(bCh)) {
+                  joinable = true;
+                }
+              }
+              if (!joinable && !geoCutsOn && gapF > 0 && gapF < 0.55 * fsRef
+                  && fragmentsStreamAdjacent(lineItems, prev, fr)) {
+                var aCh2 = readingEdgeLetter(prev.items, false);
+                var bCh2 = readingEdgeLetter(fr.items, true);
+                var hasNonJoin = !aCh2 || !bCh2 || nonJoinCh(aCh2) || nonJoinCh(bCh2);
+                if (hasNonJoin ? (gapF < 0.12 * fsRef) : (gapF < 0.45 * fsRef)) {
+                  joinable = true;
+                }
+              }
+            }
+          } else if (!prev.rtlContent && !fr.rtlContent && prev.x0 <= fr.x0 && gapF < 0.10 * fsRef) {
+            joinable = true;
+          }
+          if (!joinable) fragSep = true;
+        }
+
+        /* detect this fragment's draw direction: sort by idx before comparing x */
+        var visN = 0, logN = 0, fRtl = 0, fTot = 0;
+        var idxFrag = items2.slice().sort(function (a, b) { return a.idx - b.idx; });
+        for (var si = 1; si < idxFrag.length; si++) {
+          if (idxFrag[si].ghost || idxFrag[si - 1].ghost) continue;
+          if (idxFrag[si].x0 > idxFrag[si - 1].x0 + 0.1) visN++;
+          else if (idxFrag[si].x0 < idxFrag[si - 1].x0 - 0.1) logN++;
+        }
+        for (var sj = 0; sj < items2.length; sj++) {
+          var gs = items2[sj];
+          if (gs.ghost || gs.sen || gs.dia || gs.ch === ' ' || gs.zw) continue;
+          if (!isScriptCh(gs.ch)) continue;
+          fTot++; if (gs.dirRtl) fRtl++;
+        }
+        var fLtr = fTot - fRtl;
+        var fragRtl = (fRtl > 0 && fLtr > 0) ? rtlLine : (fRtl > 0);
+        var streamVisual = fr.mega ? true : (visN >= logN);
+
+        var seq = fragmentReadingSequence(items2, fragRtl, streamVisual, rtlLine);
+        assembleWords(seq, words, yTop, yBot, L2, fragSep, fi === 0);
+      }
+
+      /* «م|ی» rejoin (v6.7) — kept as a safety net for the book corpus */
+      for (var rj = Math.max(1, lineStartW); rj < words.length; rj++) {
+        var wI = words[rj], wP = words[rj - 1];
+        if (wI.zsep && wI.t === '\u06CC' && wP.rtl && wP.t.length >= 2 &&
+            wP.t.charAt(wP.t.length - 1) === '\u0645' && wI.line === wP.line) {
+          var mGl = (wP.g && wP.g.length) ? wP.g[wP.g.length - 1] : null;
+          wP.t = wP.t.slice(0, -1);
+          wI.t = '\u0645' + wI.t;
+          if (mGl && mGl.ch === '\u0645' && wI.g) {
+            wP.g.pop();
+            wI.g.unshift(mGl);
+            wP.x0 = 1e9; wP.x1 = -1e9;
+            for (var rg1 = 0; rg1 < wP.g.length; rg1++) {
+              if (wP.g[rg1].x0 < wP.x0) wP.x0 = wP.g[rg1].x0;
+              if (wP.g[rg1].x1 > wP.x1) wP.x1 = wP.g[rg1].x1;
+            }
+            wI.x0 = 1e9; wI.x1 = -1e9;
+            for (var rg2 = 0; rg2 < wI.g.length; rg2++) {
+              if (wI.g[rg2].x0 < wI.x0) wI.x0 = wI.g[rg2].x0;
+              if (wI.g[rg2].x1 > wI.x1) wI.x1 = wI.g[rg2].x1;
+            }
+          } else {
+            wI.x0 = wP.x0;
+            wP.x0 = wP.x0 + (wP.x1 - wP.x0) * 0.3;
+          }
+          wI.zsep = 0;
+        }
+      }
+    }
+
+    /* v1.42 (C): per-line word merge (runs once after all lines are done) */
+    for (var li = 0; li < words.length; li++) {
+      var wA = words[li];
+      if (!wA) continue;
+      var lj = li + 1;
+      while (lj < words.length) {
+        var wB = words[lj];
+        if (!wB) { lj++; continue; }
+        if (wB.line !== wA.line) break;
+        var merged = false;
+        /* v1.43: never merge two punctuation-only words — bracket glyphs
+           arriving as neighbours would fuse into an orphan «()» that no
+           attach pass can place; keep them single for open/close attach. */
+        var wAPunct = wA.t.length > 0 && !/[0-9A-Za-z\u0600-\u06FF\u200C]/.test(wA.t);
+        var wBPunct = wB.t.length > 0 && !/[0-9A-Za-z\u0600-\u06FF\u200C]/.test(wB.t);
+        if (wAPunct && wBPunct) break;
+        /* tight نیم‌فاصله pair (zg) or no-separator continuation (gap=1) */
+        if ((wB.gap === 1) || (wB.gap === 0 && wB.zg === 1)) {
+          wA.t += (wB.zg === 1 ? '\u200C' : '') + wB.t;
+          if (wA.g) wA.g = wA.g.concat(wB.g || []);
+          wA.x0 = Math.min(wA.x0, wB.x0); wA.x1 = Math.max(wA.x1, wB.x1);
+          wA.rtl = (wA.rtl || wB.rtl) ? 1 : 0;
+          words[lj] = null; merged = true;
+        } else break;
+        if (!merged) break;
+        lj++;
+      }
+    }
+
+    /* v1.53: AFFIX JOIN (strict, real Unicode escapes, proximity-checked, no 'ی'->'می' hallucination) */
+    (function affixJoin() {
+      var PRE = '\u0645\u06CC', NPRE = '\u0646\u0645\u06CC';
+      var VERBS = ['\u0634\u0648\u062F','\u0634\u0648\u0646\u062F','\u0631\u0633\u062F','\u0631\u0633\u0646\u062F',
+        '\u06A9\u0646\u062F','\u06A9\u0646\u0646\u062F','\u0631\u0648\u062F','\u0628\u0631\u0648\u062F',
+        '\u062F\u0647\u062F','\u0628\u0631\u062F','\u06AF\u06CC\u0631\u062F','\u0622\u06CC\u062F',
+        '\u0628\u0627\u0634\u062F','\u0628\u0627\u06CC\u0633\u062A','\u062A\u0648\u0627\u0646\u062F','\u062A\u0648\u0627\u0646\u0646\u062F',
+        '\u0631\u0641\u062A','\u0631\u0641\u062A\u0646\u062F','\u0634\u062F\u0646\u062F','\u0628\u06CC\u0646\u062F','\u0628\u06CC\u0646\u0646\u062F',
+        '\u06AF\u0630\u0627\u0631\u062F','\u06AF\u0630\u0627\u0631\u0646\u062F','\u0645\u0627\u0646\u062F','\u0645\u0627\u0646\u0646\u062F',
+        '\u0622\u0648\u0631\u062F','\u0622\u0648\u0631\u0646\u062F','\u0646\u0645\u0627\u06CC\u062F','\u0646\u0645\u0627\u06CC\u0646\u062F',
+        '\u0633\u0627\u0632\u062F','\u0633\u0627\u0632\u0646\u062F','\u0634\u0646\u0627\u0633\u062F','\u0634\u0646\u0627\u0633\u0646\u062F',
+        '\u062E\u0648\u0627\u0647\u062F','\u062E\u0648\u0627\u0647\u0646\u062F','\u062F\u0627\u0631\u062F','\u062F\u0627\u0631\u0646\u062F',
+        '\u0628\u0648\u062F','\u0628\u0648\u062F\u0646\u062F','\u0627\u0633\u062A','\u0627\u0646\u062F','\u06AF\u06CC\u0631\u0646\u062F'];
+      var SUF = ['\u0647\u0627\u06CC\u062A\u0627\u0646','\u0647\u0627\u06CC\u0634\u0627\u0646','\u0647\u0627\u06CC\u0645\u0627\u0646',
+        '\u0647\u0627\u06CC\u0634','\u0647\u0627\u06CC\u0645','\u0647\u0627\u06CC\u062A','\u0647\u0627\u06CC',
+        '\u062A\u0631\u06CC\u0646','\u062A\u0631\u06CC','\u062A\u0631','\u0647\u0627',
+        '\u0627\u0646\u062F','\u0627\u06CC\u0645','\u0627\u06CC\u062F','\u0627\u06CC','\u0627\u0634','\u0627\u062A','\u0627\u0645','\u0647\u0645'];
+      function stripEnd(t) { return t.replace(/[\u061B\u061F\u060C\u066B.!؟]+$/, ''); }
+      function isVerbTail(t) {
+        var core = stripEnd(t);
+        if (core === PRE || core === NPRE) return false;
+        for (var i2 = 0; i2 < VERBS.length; i2++) if (core === VERBS[i2]) return true;
+        return false;
+      }
+      function isPureSuf(t) {
+        var core = stripEnd(t);
+        if (core.length < 1 || core.length > 8) return false;
+        for (var i3 = 0; i3 < SUF.length; i3++) if (core === SUF[i3]) return true;
+        return false;
+      }
+      /* Pre-pass: join split 'م' + 'ی' -> 'می' before verb-tail pass sees 'می + شود' */
+      for (var myi = 1; myi < words.length; myi++) {
+        var myB = words[myi], myA = words[myi - 1];
+        if (!myA || !myB || myB.line !== myA.line || !myA.rtl || !myB.rtl) continue;
+        if (myA.t === '\u0645' && myB.t === '\u06CC') {
+          var myFs = Math.max(8, (myA.y1 - myA.y0) / 1.25 || 10);
+          var myGap = myA.x0 - myB.x1;
+          if (myGap <= myFs * 0.45 && (myB.zsep || myGap < myFs * 0.22)) {
+            myB.t = '\u0645\u06CC';
+            myB.x0 = Math.min(myB.x0, myA.x0); myB.x1 = Math.max(myB.x1, myA.x1);
+            if (myA.g && myB.g) myB.g = myA.g.concat(myB.g);
+            words[myi - 1] = null;
+          }
+        }
+      }
+      var aj = words.length - 1;
+      while (aj > 0) {
+        var wB = words[aj];
+        if (!wB) { aj--; continue; }
+        var pa = aj - 1;
+        while (pa >= 0 && !words[pa]) pa--;
+        if (pa < 0) break;
+        var wA = words[pa];
+        if (wB.line !== wA.line || !wA.rtl || !wB.rtl) { aj--; continue; }
+        var bTxt = wB.t, aTxt = wA.t;
+        var estFs = Math.max(8, (wA.y1 - wA.y0) / 1.25 || 10);
+        var abGap = wA.x0 - wB.x1; /* RTL: A is right, B is left */
+        if (abGap > estFs * 0.45) { aj--; continue; }
+        var joined = false;
+        /* ۱) wB = «می‌فعل» / «نمی‌فعل» only if A ends with ZWNJ-prone prefix like به/همی/باز/فرا or split ZWNJ marker */
+        var preLen = (bTxt.indexOf(NPRE) === 0) ? NPRE.length : (bTxt.indexOf(PRE) === 0 ? PRE.length : 0);
+        if (preLen > 0 && isVerbTail(bTxt.slice(preLen)) && (wB.zsep || aTxt === '\u0628\u0647' || aTxt === '\u0646\u0647')) {
+          wA.t = aTxt + '\u200C' + bTxt;
+          wA.x0 = Math.min(wA.x0, wB.x0); wA.x1 = Math.max(wA.x1, wB.x1);
+          if (wA.g && wB.g) wA.g = wA.g.concat(wB.g);
+          words[aj] = null; joined = true;
+        }
+        /* ۲) wB پسوند خالص (تنها اگر واقعاً نزدیک باشد یا wB.zsep داشته باشد) */
+        else if (isPureSuf(bTxt) && aTxt.length >= 2 && (wB.zsep || abGap < estFs * 0.25)) {
+          wA.t = aTxt + '\u200C' + bTxt;
+          wA.x0 = Math.min(wA.x0, wB.x0); wA.x1 = Math.max(wA.x1, wB.x1);
+          if (wA.g && wB.g) wA.g = wA.g.concat(wB.g);
+          words[aj] = null; joined = true;
+        }
+        /* ۳) پیشوندهای «می» — «م|ی»→«می»؛ «م|فعل»→«می‌فعل»؛ «می/نمی|فعل»→«می‌فعل» */
+        if (!joined) {
+          var aIsM = aTxt === '\u0645';
+          var aIsNmi = aTxt === '\u0646\u0645\u06CC' || aTxt === '\u0646\u0645\u200C\u06CC';
+          var aIsMi = aTxt === '\u0645\u06CC' || aTxt === '\u0645\u200C\u06CC' || aIsNmi;
+          if (aIsM && bTxt === '\u06CC' && (wB.zsep || abGap < estFs * 0.22)) {
+            wB.t = '\u0645\u06CC';
+            wB.x0 = Math.min(wB.x0, wA.x0); wB.x1 = Math.max(wB.x1, wA.x1);
+            if (wA.g && wB.g) wB.g = wA.g.concat(wB.g);
+            words[pa] = null; joined = true;
+          } else if (aIsM && isVerbTail(bTxt) && (wB.zsep || abGap < estFs * 0.25)) {
+            wB.t = '\u0645\u06CC\u200C' + bTxt;
+            wB.x0 = Math.min(wB.x0, wA.x0); wB.x1 = Math.max(wB.x1, wA.x1);
+            if (wA.g && wB.g) wB.g = wA.g.concat(wB.g);
+            words[pa] = null; joined = true;
+          } else if (aIsMi && isVerbTail(bTxt) && (wB.zsep || abGap < estFs * 0.25)) {
+            wB.t = (aIsNmi ? '\u0646\u0645\u06CC\u200C' : '\u0645\u06CC\u200C') + bTxt;
+            wB.x0 = Math.min(wB.x0, wA.x0); wB.x1 = Math.max(wB.x1, wA.x1);
+            if (wA.g && wB.g) wB.g = wA.g.concat(wB.g);
+            words[pa] = null; joined = true;
+          }
+        }
+        /* ۴) «ه» جداشده (فقط در مجاورت نزدیک بدون فاصلهٔ واژه) + «گان» پسوند */
+        if (!joined) {
+          if (bTxt === '\u0647' && aTxt.length >= 2 && (wB.zsep || abGap < estFs * 0.20) &&
+              !/[\u0647\u061B\u061F\u060C.,:]$/.test(aTxt)) {
+            wA.t = aTxt + '\u0647';
+            wA.x0 = Math.min(wA.x0, wB.x0); wA.x1 = Math.max(wA.x1, wB.x1);
+            if (wA.g && wB.g) wA.g = wA.g.concat(wB.g);
+            words[aj] = null; joined = true;
+          } else if ((bTxt === '\u06AF\u0627\u0646' || bTxt === '\u06AF\u0627\u0646\u0645\u0627\u0646' ||
+                      bTxt === '\u06AF\u0627\u0646\u0645\u0627\u0646.') && aTxt.length >= 2 && (wB.zsep || abGap < estFs * 0.28)) {
+            wA.t = aTxt + '\u200C' + bTxt;
+            wA.x0 = Math.min(wA.x0, wB.x0); wA.x1 = Math.max(wA.x1, wB.x1);
+            if (wA.g && wB.g) wA.g = wA.g.concat(wB.g);
+            words[aj] = null; joined = true;
+          }
+        }
+        aj--;
+      }
+      var alive2 = [];
+      for (var ac = 0; ac < words.length; ac++) if (words[ac]) alive2.push(words[ac]);
+      words.length = 0;
+      for (var ac2 = 0; ac2 < alive2.length; ac2++) words.push(alive2[ac2]);
+    })();
+
+
+        /* v1.43: mirrored-pair normalization (before punct attach).
+       Two producer families store parens differently at the same visual
+       spot: LibreOffice writes the LOGICAL codepoint (opening «(» to the
+       RIGHT of the Latin run), Word/PPT writes the already-MIRRORED visual
+       glyph (opening shape to the LEFT). Reading order alone can't tell
+       them apart — but bracket BALANCE can: if the assembled line's
+       brackets dip negative yet are perfectly balanced when every
+       mirrored char is flipped, the line came from the visual-glyph
+       family — flip it. Half-quotes and unmatched brackets never flip
+       (both variants must be tested strictly). */
+    (function mirrorNormalize() {
+      var OPN = { '(': 1, '[': 1, '{': 1, '«': 1 };
+      var CLS = { ')': 1, ']': 1, '}': 1, '»': 1 };
+      function depthOf(txtArr, flip) {
+        var d = 0, min = 0;
+        for (var i = 0; i < txtArr.length; i++) {
+          var s = txtArr[i];
+          for (var j = 0; j < s.length; j++) {
+            var c = s.charAt(j);
+            if (OPN[c]) { d += flip ? -1 : 1; if (d < min) min = d; }
+            else if (CLS[c]) { d += flip ? 1 : -1; if (d < min) min = d; }
+          }
+        }
+        return { end: d, min: min };
+      }
+      var liM = 0;
+      while (liM < words.length) {
+        if (!words[liM]) { liM++; continue; }
+        var liEnd = liM;
+        while (liEnd + 1 < words.length && words[liEnd + 1] && words[liEnd + 1].line === words[liM].line) liEnd++;
+        var txts = [];
+        var hasMirror = false;
+        for (var wi = liM; wi <= liEnd; wi++) {
+          if (!words[wi]) continue;
+          txts.push(words[wi].t);
+          for (var wj = 0; wj < words[wi].t.length; wj++)
+            if (isMirrorCh(words[wi].t.charAt(wj))) { hasMirror = true; break; }
+        }
+        if (hasMirror) {
+          var asIs = depthOf(txts, false);
+          var flipd = depthOf(txts, true);
+          var asIsOk = asIs.min >= 0 && asIs.end === 0;
+          var flipOk = flipd.min >= 0 && flipd.end === 0;
+          /* v1.52: براکت چسبیده به لاتین هرگز فلیپ نشود — «(Aesculapius)» درست بود
+             و فلیپِ کل خط آن را به «()Aesculapius» تبدیل می‌کرد */
+          var latinBracket = false;
+          for (var lb = 0; lb < txts.length; lb++) {
+            if (/[A-Za-z]/.test(txts[lb]) && /[()\[\]{}\u00AB\u00BB]/.test(txts[lb])) { latinBracket = true; break; }
+          }
+          if (flipOk && !asIsOk && !latinBracket) {
+            for (var wk = liM; wk <= liEnd; wk++) {
+              if (!words[wk]) continue;
+              var nt = '';
+              for (var wl = 0; wl < words[wk].t.length; wl++) {
+                var wc = words[wk].t.charAt(wl);
+                nt += MIRROR[wc] || wc;
+              }
+              words[wk].t = nt;
+            }
+          }
+        }
+        liM = liEnd + 1;
+      }
+    })();
+
+    /* single punctuation mark attaches to its word */
+    /* v1.43: skip punctuation-only words while searching the attach
+       target — an open bracket used to glue onto the neighbouring close
+       bracket and form an orphan «()» that nothing could place. */
+    var ATTACH_SKIP = /^[\u200C\u200B(){}\[\]«»،؛؟.!…:;,\-–—\/]+$/;
+    for (var pk = 0; pk < words.length; pk++) {
+      var wP2 = words[pk];
+      if (!wP2 || wP2.t.length !== 1) continue;
+      var cP = wP2.t;
+      if (P_OPEN.indexOf(cP) >= 0) {
+        /* open mark goes to the NEXT word's front */
+        for (var pn = pk + 1; pn < words.length; pn++) {
+          var wN = words[pn];
+          if (!wN) continue;
+          if (wN.line !== wP2.line) break;
+          if (ATTACH_SKIP.test(wN.t)) continue;   /* jump over lone marks */
+          wN.t = cP + wN.t;
+          if (wN.g && wP2.g) wN.g = wP2.g.concat(wN.g);
+          wN.x0 = Math.min(wN.x0, wP2.x0); wN.x1 = Math.max(wN.x1, wP2.x1);
+          words[pk] = null;
+          break;
+        }
+      } else if (P_CLOSE.indexOf(cP) >= 0 || P_END.indexOf(cP) >= 0 || cP === '،' || cP === '؛' || cP === '؟') {
+        for (var pp = pk - 1; pp >= 0; pp--) {
+          var wQ = words[pp];
+          if (!wQ) continue;
+          if (wQ.line !== wP2.line) break;
+          if (ATTACH_SKIP.test(wQ.t)) continue;   /* jump over lone marks */
+          wQ.t += cP;
+          if (wQ.g && wP2.g) wQ.g = wQ.g.concat(wP2.g);
+          wQ.x0 = Math.min(wQ.x0, wP2.x0); wQ.x1 = Math.max(wQ.x1, wP2.x1);
+          words[pk] = null;
+          break;
+        }
+      }
+    }
+    /* compact nulls */
+    var alive = [];
+    for (var pc = 0; pc < words.length; pc++) if (words[pc]) alive.push(words[pc]);
+    /* BRACKET REPAIR (post-attach, runs on alive words & keeps w.g synced) */
+    for (var brp = 0; brp < alive.length; brp++) {
+      var wr = alive[brp];
+      if (!wr || !wr.t) continue;
+      var mbr = wr.t.match(/^([()\[\u00AB])([)\]\u00BB])([A-Za-z0-9]+)$/);
+      if (mbr) {
+        wr.t = mbr[1] + mbr[3] + mbr[2];
+        if (wr.g && wr.g.length === wr.t.length) {
+          var bg0 = wr.g[0], bg1 = wr.g[1];
+          wr.g = [bg0].concat(wr.g.slice(2), [bg1]);
+        }
+      }
+    }
+    words.length = 0;
+    for (var pc2 = 0; pc2 < alive.length; pc2++) words.push(alive[pc2]);
+
+    /* RTL-aware 2-column reading order (so search, copy, and Word export agree) */
+    (function reorderColumnsEngine() {
+      if (words.length < 8) return;
+      var minW = 1e9, maxW = -1e9, emSum = 0, emN = 0;
+      var cands = [];
+      for (var wi0 = 0; wi0 < words.length; wi0++) {
+        var ww = words[wi0];
+        var sx0 = Math.min(ww.x0, ww.x1), sx1 = Math.max(ww.x0, ww.x1);
+        if (sx0 < minW) minW = sx0;
+        if (sx1 > maxW) maxW = sx1;
+        var wh = ww.y1 - ww.y0;
+        if (wh > 1 && wh < 200) { emSum += wh; emN++; }
+        cands.push(sx0, sx1);
+      }
+      var spanW = maxW - minW;
+      if (spanW <= 40) return;
+      var em = emN > 0 ? emSum / emN : 10;
+      var minGap = Math.max(em * 1.6, spanW * 0.045);
+      cands.sort(function (a, b) { return a - b; });
+      var bestCut = NaN, bestGap = 0, prevC = NaN;
+      for (var ci0 = 0; ci0 < cands.length; ci0++) {
+        var cut = cands[ci0];
+        if (cut === prevC) continue;
+        prevC = cut;
+        if (cut < minW + spanW * 0.15 || cut > maxW - spanW * 0.15) continue;
+        var leftEdge = -1e9, rightEdge = 1e9, lw = 0, rw = 0;
+        var lLines = {}, rLines = {}, lLn = 0, rLn = 0, crossed = false;
+        for (var wi1 = 0; wi1 < words.length; wi1++) {
+          var wx0 = Math.min(words[wi1].x0, words[wi1].x1);
+          var wx1 = Math.max(words[wi1].x0, words[wi1].x1);
+          if (wx1 <= cut) {
+            lw++;
+            if (wx1 > leftEdge) leftEdge = wx1;
+            if (!lLines[words[wi1].line]) { lLines[words[wi1].line] = 1; lLn++; }
+          } else if (wx0 >= cut) {
+            rw++;
+            if (wx0 < rightEdge) rightEdge = wx0;
+            if (!rLines[words[wi1].line]) { rLines[words[wi1].line] = 1; rLn++; }
+          } else { crossed = true; break; }
+        }
+        if (crossed || lw < 4 || rw < 4 || lLn < 3 || rLn < 3) continue;
+        var gapC = rightEdge - leftEdge;
+        if (gapC >= minGap && gapC > bestGap) { bestGap = gapC; bestCut = cut; }
+      }
+      if (isNaN(bestCut)) return;
+      for (var wi2 = 0; wi2 < words.length; wi2++) words[wi2]._oi = wi2;
+      words.sort(function (a, b) {
+        var ca = ((a.x0 + a.x1) * 0.5 < bestCut) ? 0 : 1;
+        var cb = ((b.x0 + b.x1) * 0.5 < bestCut) ? 0 : 1;
+        if (ca !== cb) return pageRtl ? (cb - ca) : (ca - cb);
+        if (a.line !== b.line) return a.line - b.line;
+        return a._oi - b._oi;
+      });
+      for (var wi3 = 0; wi3 < words.length; wi3++) delete words[wi3]._oi;
+    })();
+
+    /* br flags: first word of each new line or column switch */
+    var lastLine = -1, lastYMid = -1;
+    for (var z2 = 0; z2 < words.length; z2++) {
+      var yMid = (words[z2].y0 + words[z2].y1) * 0.5;
+      var newCol = lastYMid >= 0 && yMid < lastYMid - 10;
+      if (words[z2].line !== lastLine || newCol) {
+        words[z2].br = lastLine < 0 ? 0 : 1;
+        lastLine = words[z2].line;
+      } else {
+        words[z2].br = 0;
+      }
+      lastYMid = yMid;
+    }
+    return words;
+  }
+
+  /* ---- pair-cut rules over one LINE (x-sorted items of all fragments) ---- */
+  function applyPairCuts(line, rtlLine, streamVisual, Tc, Td, geoCutsOn) {
+    for (var n = 1; n < line.length; n++) {
+      var Pv = line[n - 1], Nx = line[n];
+      if (Nx.ch === '\u200C') {
+        var li = n - 1;
+        while (li >= 0 && (line[li].zw || line[li].ghost || line[li].sen)) li--;
+        var ri = n + 1;
+        while (ri < line.length && (line[ri].zw || line[ri].ghost || line[ri].sen)) ri++;
+        var holeL = li >= 0 ? line[li].x1 : -1e9;
+        var holeR = ri < line.length ? line[ri].x0 : 1e9;
+        var fsZ = Math.max(Nx.fs || 10, 10);
+        var holeEm = (holeR - holeL) / fsZ;
+        var rightGapEm = ri < line.length ? (line[ri].x0 - Nx.x1) / fsZ : 1e9;
+        if ((Nx.kernEm || 0) <= -0.06 || holeEm >= 0.08 || rightGapEm >= 0.08 ||
+            (Nx.advEm || 0) >= 0.12 || Nx.sepCand || Nx.sep) {
+          Nx.cut = true;
+          Nx.zhole = holeEm;
+        }
+        continue;
+      }
+      if (Nx.zw || Pv.zw || Nx.ghost || Pv.ghost || Nx.sen || Pv.sen) continue;
+      if (Nx.ch === ' ' || Pv.ch === ' ') continue;
+      if (Pv._uf != null && Nx._uf != null && Pv._uf !== Nx._uf) continue;
+      var pvCh = Pv.ch, nxCh = Nx.ch;
+      var M;
+      if (isLtrCh(pvCh) && isLtrCh(nxCh)) M = Nx;
+      else if (isLtrCh(pvCh)) {
+        var rs = n - 1;
+        while (rs > 0 && (isLtrCh(line[rs - 1].ch) || isJoinNeutral(line[rs - 1].ch))) rs--;
+        M = line[rs];
+      } else M = Pv;
+      if (M.cut) continue;
+      var fsPair = Math.max(Nx.fs, Pv.fs);
+      var vg = Nx.x0 - Pv.x1;
+      var vgEm = vg / fsPair;
+
+      /* punctuation orthography — direction-aware (v6.7) */
+      var pairLtrish = isLtrCh(pvCh) || isLtrCh(nxCh);
+      var bnd = false;
+      if (!pairLtrish && rtlLine) {
+        if (isLetterCh(pvCh) && (P_END.indexOf(nxCh) >= 0 || P_CLOSE.indexOf(nxCh) >= 0)) bnd = true;
+        else if (isLetterCh(nxCh) && P_OPEN.indexOf(pvCh) >= 0) bnd = true;
+      } else {
+        if (isLetterCh(nxCh) && (P_END.indexOf(pvCh) >= 0 || P_CLOSE.indexOf(pvCh) >= 0)) bnd = true;
+        else if (isLetterCh(pvCh) && P_OPEN.indexOf(nxCh) >= 0) bnd = true;
+      }
+      if (bnd) {
+        var guarded = (P_GUARD.indexOf(pvCh) >= 0 && (isDigitCh(nxCh) || (isLatinCh(nxCh) && vgEm < 0.03))) ||
+                      (P_GUARD.indexOf(nxCh) >= 0 && (isDigitCh(pvCh) || (isLatinCh(pvCh) && vgEm < 0.03)));
+        if (!guarded) { M.cut = true; continue; }
+      }
+
+      /* v6.6: big negative kern = compressed word space */
+      var Kg = streamVisual ? Nx : Pv;
+      if ((Kg.kernEm || 0) <= -0.10) { M.cut = true; continue; }
+
+      /* v7 FIX #2: kern-explained gaps are NEVER geometric cuts.
+         A pair whose gap equals a carried sub-space kern (the
+         producer deliberately set this spacing — tight justification
+         or glyph nudging) is intra-word; real spaces arrive as
+         ≥0.12em kerns (sentinels), wide ZWNJs, space glyphs, or
+         fragment breaks. */
+      var kn = Math.max(Math.abs(Pv.kernEm || 0), Math.abs(Nx.kernEm || 0));
+      if (kn > 0.005 && kn < 0.12 && Math.abs(Math.abs(vgEm) - kn) < 0.03) continue;
+
+      /* pair-aware geometric cut (modal thresholds) — only on marker-poor
+         pages; marker-rich pages rely on their explicit space evidence */
+      if (geoCutsOn) {
+        if (nonJoinCh(pvCh) || nonJoinCh(nxCh)) {
+          if (vg > fsPair * Td) M.cut = true;
+        } else {
+          if (vg > fsPair * Tc) M.cut = true;
+        }
+      }
+    }
+  }
+
+  /* v1.41: are two fragments consecutive in the CONTENT STREAM?
+     (only phantom spaces / sentinels / ghosts between their real glyphs,
+     and no OTHER fragment's real glyph in between) — the Word/Nazanin
+     producer splits one word into stream-consecutive fragments.
+     A space/sentinel that sits FAR from the two fragments' geometric
+     boundary is a bidi positioning artifact parked elsewhere on the line
+     — it does not block adjacency (measured on the خصیه/تک‌لایه corpus). */
+  function fragmentsStreamAdjacent(lineItems, a, b) {
+    try {
+      var lastA = -1, firstB = 1e9;
+      var i, it;
+      for (i = 0; i < a.items.length; i++) {
+        it = a.items[i];
+        if (it.ghost || it.sen || it.ch === ' ' || it.ch === '' || it.zw) continue;
+        if (it.idx > lastA) lastA = it.idx;
+      }
+      for (i = 0; i < b.items.length; i++) {
+        it = b.items[i];
+        if (it.ghost || it.sen || it.ch === ' ' || it.ch === '' || it.zw) continue;
+        if (it.idx < firstB) firstB = it.idx;
+      }
+      if (lastA < 0 || firstB === 1e9) return false;
+      if (firstB <= lastA) return false;         /* interleaved — not adjacent */
+      /* geometric boundary zone between the two fragments */
+      var zL = Math.min(a.x0, b.x1) - 2.5, zR = Math.max(a.x0, b.x1) + 2.5;
+      var zfs = Math.max(10, fsApprox(a.items.concat(b.items)));
+      zR += zfs;                                  /* +1em tolerance */
+      /* anything REAL (other fragments' glyphs, near-boundary spaces) between? */
+      for (i = 0; i < lineItems.length; i++) {
+        it = lineItems[i];
+        if (it.idx <= lastA || it.idx >= firstB) continue;
+        if (it.ghost || it.sen && (it.x0 < zL || it.x0 > zR)) continue;
+        if (it.ch === '') continue;
+        if (it.ch === ' ') {
+          if (it.ph) continue;                    /* phantom — artifact */
+          if (it.x0 < zL || it.x0 > zR) continue; /* far positioning artifact */
+          return false;                          /* a real space at the boundary */
+        }
+        if (it.zw && !it.cut) continue;
+        return false;                            /* real glyph of another fragment */
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* ---- assemble words from a reading-ordered glyph sequence -------------- */
+  function assembleWords(seq, words, yTop, yBot, lineIdx, fragSep, fragFirst) {
+    /* each fragment assembles its own words; fragSep only marks that a
+       visual space precedes this fragment's first word (gap=0 on copy)
+       v1.41: phantom spaces are skipped entirely; a NON-separator ZWNJ
+       stays inside the word text (نیم‌فاصله survives copy: «می‌تونی»);
+       a separator ZWNJ records whether it had a visible hole — a tight
+       one copies as ZWNJ, a wide one as a space (zg flag). */
+    var w = null, sepPending = !!fragSep, sepZw = false, sepZg = 0;
+    for (var t = 0; t < seq.length; t++) {
+      var g2 = seq[t];
+      if (g2.ghost) continue;
+      if (g2.sen) {
+        w = finishWord(w, words, yTop, yBot, lineIdx);
+        sepPending = true; sepZw = false; sepZg = 0;
+        continue;
+      }
+      if ((g2.ch === ' ' && !g2.ph) || (g2.ch === '\u200C' && g2.cut) || (g2.zw && g2.sep)) {
+        w = finishWord(w, words, yTop, yBot, lineIdx);
+        sepPending = true;
+        sepZw = (g2.ch === '\u200C');
+        /* Wide ZWNJ (sepCand >= 0.12em), punctuation-adjacent ZWNJ (g2.sep), or visible hole >= 0.12em => real space (zg=0) */
+        sepZg = (g2.ch === '\u200C' && !g2.sepCand && !g2.sep && !(g2.zhole != null && g2.zhole >= 0.12)) ? 1 : 0;
+        continue;
+      }
+      if (g2.zw) {
+        if (w) w.glyphs.push(g2);
+        continue;
+      }
+      if (g2.ch === ' ') continue;
+      if (g2.cut && w) {
+        w = finishWord(w, words, yTop, yBot, lineIdx);
+        sepPending = true; sepZw = false; sepZg = 0;
+      }
+      if (!w) w = { glyphs: [], x0: 1e9, x1: -1e9, gap: (g2.cut || sepPending) ? 0 : 1, zsep: sepZw, zg: sepZg };
+      sepPending = false; sepZw = false; sepZg = 0;
+      w.glyphs.push(g2);
+      if (g2.x0 < w.x0) w.x0 = g2.x0;
+      if (g2.x1 > w.x1) w.x1 = g2.x1;
+    }
+    finishWord(w, words, yTop, yBot, lineIdx);
+  }
+
+  /* close a word under construction and append it to `words` */
+  function finishWord(w, words, yTop, yBot, lineIdx) {
+    if (!w) return null;
+    var txt = '';
+    var cleanGlyphs = [];
+    for (var z = 0; z < w.glyphs.length; z++) {
+      if (!w.glyphs[z].ch) continue;
+      txt += w.glyphs[z].ch;
+      cleanGlyphs.push(w.glyphs[z]);
+    }
+    /* Trim leading/trailing ZWNJ/invisible marks/spaces while keeping cleanGlyphs aligned */
+    while (cleanGlyphs.length && /^[\u200C\u200B\u00AD\u200E\u200F\s]$/.test(cleanGlyphs[0].ch)) {
+      cleanGlyphs.shift();
+    }
+    while (cleanGlyphs.length && /^[\u200C\u200B\u00AD\u200E\u200F\s]$/.test(cleanGlyphs[cleanGlyphs.length - 1].ch)) {
+      cleanGlyphs.pop();
+    }
+    /* Collapse doubled ZWNJ (phantom + real) identically in txt and cleanGlyphs */
+    var dedup = [];
+    txt = '';
+    for (var dz = 0; dz < cleanGlyphs.length; dz++) {
+      if (cleanGlyphs[dz].ch === '\u200C' && dedup.length && dedup[dedup.length - 1].ch === '\u200C') continue;
+      dedup.push(cleanGlyphs[dz]);
+      txt += cleanGlyphs[dz].ch;
+    }
+    if (txt.length && w.x1 > w.x0 - 0.001) {
+      words.push({
+        x0: Math.round(w.x0 * 100) / 100,
+        y0: Math.round(yTop * 100) / 100,
+        x1: Math.round(w.x1 * 100) / 100,
+        y1: Math.round(yBot * 100) / 100,
+        line: lineIdx,
+        t: txt,
+        rtl: strHasRtl(txt) ? 1 : 0,
+        gap: w.gap,
+        br: 0,
+        zsep: w.zsep ? 1 : 0,
+        zg: w.zg ? 1 : 0,
+        g: dedup
+      });
+    }
+    return null;
+  }
+
+  function applyViewportTransform(glyphs, tf) {
+    const tScale = Math.hypot(tf[0], tf[1]) || 1;
+    for (let i = 0; i < glyphs.length; i++) {
+      const g = glyphs[i];
+      if (g.u0 != null && g.v0 != null && g.u1 != null && g.v1 != null) {
+        const ax = tf[0] * g.u0 + tf[2] * g.v0 + tf[4];
+        const ay = tf[1] * g.u0 + tf[3] * g.v0 + tf[5];
+        const bx = tf[0] * g.u1 + tf[2] * g.v1 + tf[4];
+        const by = tf[1] * g.u1 + tf[3] * g.v1 + tf[5];
+        g.x0 = Math.min(ax, bx);
+        g.x1 = Math.max(ax, bx);
+        g.y = (ay + by) * 0.5;
+      } else {
+        const ax = tf[0] * g.x0 + tf[2] * g.y + tf[4];
+        const ay = tf[1] * g.x0 + tf[3] * g.y + tf[5];
+        const bx = tf[0] * g.x1 + tf[2] * g.y + tf[4];
+        g.x0 = Math.min(ax, bx);
+        g.x1 = Math.max(ax, bx);
+        g.y = ay;
+      }
+      if (g.fs) g.fs = g.fs * tScale;
+    }
+  }
+
+  /* ---------------- public API ---------------------------------------------- */
+  async function pageWords(page) {
+    const opList = await page.getOperatorList();
+    const OPS = (typeof pdfjsLib !== 'undefined' && pdfjsLib.OPS) ? pdfjsLib.OPS
+      : (typeof pdfjs !== 'undefined' && pdfjs.OPS ? pdfjs.OPS : null);
+    const vp = page.getViewport({ scale: 1 });
+    const glyphs = replayOps(opList, OPS);
+    const tf = vp.transform;
+    if (tf && tf.length >= 6) {
+      applyViewportTransform(glyphs, tf);
+      return { vw: vp.width, vh: vp.height, words: glyphsToWords(glyphs, 0) };
+    }
+    return { vw: vp.width, vh: vp.height, words: glyphsToWords(glyphs, vp.height) };
+  }
+
+  function wordsToText(words) {
+    var out = '';
+    for (var i = 0; i < words.length; i++) {
+      if (words[i].br) out += '\n';
+      else if (words[i].gap === 0 && out.length && out[out.length - 1] !== '\n') {
+        out += words[i].zg ? '\u200C' : ' ';   /* v1.41: tight ZWNJ survives */
+      }
+      out += words[i].t;
+    }
+    return out;
+  }
+
+  return {
+    pageWords: pageWords,
+    glyphsToWords: glyphsToWords,
+    replayOps: replayOps,
+    applyViewportTransform: applyViewportTransform,
+    wordsToText: wordsToText
+  };
+})();
+
+
+/* ============================================================
+   Search — uses the SAME v5 word stream the copy path uses, so the
+   page text has real spaces where the visual spaces are, and the
+   typed query matches the copied text symmetrically.
+
+   v1.16 fixes:
+   - WHOLE-DOCUMENT search: starts at the current page, runs to the
+     last page, then wraps around to page 1 and continues up to the
+     page before the start (Xodo/Adobe search the entire file, not
+     just the remainder — v1.15 silently ignored all earlier pages).
+   - generation counter: a second startSearch (or rapid re-tap) kills
+     the stale loop instead of interleaving duplicate results.
+   - snippets come from the ORIGINAL page text (harakat, real yeh/kaf,
+     real digits) — normalization is used only for MATCHING. Hit
+     positions in the normalized haystack are mapped back to word
+     indexes, so the result list shows the document's own words.
+   ============================================================ */
+var searchGen = 0;
+
+/* ~110-char snippet from the ORIGINAL words around word index w */
+function snippetAround(words, w) {
+  if (!words.length) return '';
+  var wStart = Math.max(0, w - 7);
+  var wEnd = Math.min(words.length - 1, w + 12);
+  var out = '';
+  for (var i = wStart; i <= wEnd; i++) {
+    if (i > wStart) {
+      if (words[i].br) out += '\n';
+      else if (words[i].gap === 0) out += ' ';
+    }
+    out += words[i].t;
+  }
+  if (out.length > 130) out = out.substring(0, 130);
+  if (wStart > 0) out = '\u2026' + out;
+  if (wEnd < words.length - 1) out += '\u2026';
+  return out;
+}
+
+async function startSearch(url, rawQuery, fromPage, password) {
+  var gen = ++searchGen;
+  searchCancelled = false;
+  try {
+    destroyDoc();
+    var task = pdfjsLib.getDocument({ url: url, isEvalSupported: false, disableFontFace: true,
+                                       password: password || undefined });
+    doc = await task.promise;
+    if (gen !== searchGen) { destroyDoc(); return; }
+    AndroidSearch.onDocInfo(doc.numPages);
+    var qNorm = norm(rawQuery);
+    var qCompact = normCompact(rawQuery);
+    /* v1.29 FIX: destroy the freshly opened doc on the empty-query early
+       return — it used to stay alive (full PDF proxy + worker) until the
+       next startSearch, holding significant memory. */
+    if (!qNorm && !qCompact) { AndroidSearch.onSearchDone(0); destroyDoc(); return; }
+    var total = doc.numPages;
+    var start = Math.max(1, Math.min(total, fromPage | 0));
+    var found = 0, scanned = 0, capped = false;
+    /* pass 0: current page → end; pass 1: page 1 → start-1 (wrap) */
+    for (var pass = 0; pass < 2; pass++) {
+      var from = pass === 0 ? start : 1;
+      var to = pass === 0 ? total : start - 1;
+      for (var i = from; i <= to; i++) {
+        if (gen !== searchGen) {
+          /* v1.16: superseded by a newer startSearch — exit SILENTLY and
+             touch nothing: the newer call owns the global doc now, and a
+             destroyDoc()/onSearchDone() from this stale loop would kill
+             the running search or double-reset the Java UI. */
+          return;
+        }
+        if (searchCancelled) {
+          AndroidSearch.onSearchDone(found);
+          destroyDoc();
+          return;
+        }
+        var page = await doc.getPage(i);
+        var res = await PkEngine.pageWords(page);
+        page.cleanup();
+        if (gen !== searchGen) return;
+
+        /* haystack built word-by-word so every character knows which
+           ORIGINAL word it belongs to (owner[]); separators mirror
+           wordsToText exactly (br → newline, gap===0 → space). */
+        var words = res.words;
+        var hay2 = '', owner = [];
+        for (var wI = 0; wI < words.length; wI++) {
+          if (wI > 0) {
+            var sep = words[wI].br ? '\n' : (words[wI].gap === 0 ? ' ' : '');
+            for (var si = 0; si < sep.length; si++) { hay2 += sep.charAt(si); owner.push(-1); }
+          }
+          var tn = norm(words[wI].t);
+          for (var ci = 0; ci < tn.length; ci++) { hay2 += tn.charAt(ci); owner.push(wI); }
+        }
+
+        var hits = qNorm ? indexOfAll(hay2, qNorm) : [];
+        if (qCompact && qCompact !== qNorm) {
+          var map = [];
+          for (var c = 0; c < hay2.length; c++) {
+            if (hay2.charAt(c) !== ' ') map.push(c);
+          }
+          var hc = indexOfAll(hay2.replace(/ /g, ''), qCompact);
+          for (var hi = 0; hi < hc.length; hi++) {
+            var p1 = map[hc[hi]];
+            var dup = false;
+            for (var h2 = 0; h2 < hits.length; h2++) {
+              if (Math.abs(hits[h2] - p1) <= 2) { dup = true; break; }
+            }
+            if (!dup) hits.push(p1);
+          }
+          hits.sort(function (a, b) { return a - b; });
+        }
+        for (var h = 0; h < hits.length; h++) {
+          /* v1.27 FIX: a common word in a large book produced thousands of
+             bridge calls + unbounded result lists — cap at 500 like the Java
+             side and tell the user the search was capped. */
+          if (found >= 500) { capped = true; break; }
+          found++;
+          var wStart = hits[h] < owner.length ? owner[hits[h]] : -1;
+          if (wStart < 0) { /* hit landed on a separator — take the next word */
+            var k2 = hits[h];
+            while (k2 < owner.length && owner[k2] < 0) k2++;
+            wStart = k2 < owner.length ? owner[k2] : (words.length ? words.length - 1 : 0);
+          }
+          AndroidSearch.onSearchResult(i, snippetAround(words, wStart));
+        }
+        scanned++;
+        if (scanned === 1 || scanned % 3 === 0 || scanned === total) {
+          AndroidSearch.onProgress(scanned, total);
+        }
+        await new Promise(function (r) { setTimeout(r, 0); }); // yield to UI
+      }
+      if (start === 1) break; /* already covered everything */
+    }
+    if (gen !== searchGen) return; /* superseded during the final await */
+    if (capped) AndroidSearch.onSearchDone(-1); /* v1.27: -1 = capped marker */
+    else AndroidSearch.onSearchDone(found);
+    destroyDoc();
+  } catch (e) {
+    /* v1.29 FIX: only the CURRENT generation may report errors — a superseded
+       run dying inside an await (destroyDoc() from the newer call) used to
+       fire onError and clobber the NEW search's UI state. */
+    if (gen === searchGen) reportErr(e);
+  }
+}
+
+function cancelSearch() { searchCancelled = true; }
+
+/* ============================================================
+   Selection — the words of one page with exact boxes (viewport
+   scale=1 units, y grows downwards). Wire format (unchanged):
+     [x0, y0, x1, y1, line, t, rtl, gap, br]
+     gap: 0 = real space before this word, 1 = glued to previous
+     br:  1 = first word of a new line
+   ============================================================ */
+
+var selDoc = null;
+var selUrl = null;
+var selBusy = false;
+var selWant = 0; /* v1.16: latest requested page — processed when the current extraction finishes */
+
+async function requestWords(url, page1, password) {
+  try {
+    if (!selDoc || selUrl !== url) {
+      if (selDoc) { try { selDoc.destroy(); } catch (e) {} selDoc = null; }
+      selUrl = url;
+      var task = pdfjsLib.getDocument({ url: url, isEvalSupported: false, disableFontFace: true,
+                                         password: password || undefined });
+      selDoc = await task.promise;
+    }
+    /* v1.16 FIX: the old code DROPPED the request when an extraction was
+       still running — a long-press during that window silently did
+       nothing until the user pressed again. Now the latest request is
+       remembered and processed right after the running one. */
+    selWant = page1;
+    if (selBusy) return;
+    selBusy = true;
+    while (selWant >= 1) {
+      var p = selWant;
+      selWant = 0;
+      try {
+        var page = await selDoc.getPage(p);
+        var res = await PkEngine.pageWords(page);
+        page.cleanup();
+
+        var wire = [];
+        for (var i = 0; i < res.words.length; i++) {
+          var w = res.words[i];
+          /* v1.41 wire v2: [x0,y0,x1,y1,line,t,rtl,gap,br, zg, gl]
+             gl = per-char boxes in reading order [[ch,x0,x1],…] — enables
+             character-precise selection handles (word AND letter level) */
+          var gl = null;
+          if (w.g) {
+            /* v1.42: CHAR-BOX SANITY — LibreOffice gives the word's FIRST-drawn
+               letter a ~1em advance (justification artifact): its box swallows
+               the word's left half and drags the selection handles off. When a
+               glyph box exceeds 0.8em, or neighbours overlap >35%, redistribute
+               the boxes evenly across the word's own span (letters keep reading
+               order; edges keep the word box). */
+            var gs = [];
+            for (var gi = 0; gi < w.g.length; gi++) {
+              var gg = w.g[gi];
+              if (!gg.ch || gg.ch === ' ') continue;
+              gs.push(gg);
+            }
+            if (gs.length >= 2) {
+              var fsR = 0;
+              for (var gq = 0; gq < gs.length; gq++) if (gs[gq].fs && gs[gq].fs < 200) fsR = Math.max(fsR, gs[gq].fs);
+              if (fsR < 8) fsR = (w.y1 - w.y0) / 1.25 || 10;
+              var bad = false;
+              for (var gq2 = 0; gq2 < gs.length && !bad; gq2++) {
+                var bw = gs[gq2].x1 - gs[gq2].x0;
+                if (bw > 0.8 * fsR) { bad = true; break; }
+                if (gq2 > 0) {
+                  var pv = gs[gq2 - 1], nx = gs[gq2];
+                  var ov = Math.min(pv.x1, nx.x1) - Math.max(pv.x0, nx.x0);
+                  var mw = Math.min(pv.x1 - pv.x0, nx.x1 - nx.x0);
+                  if (mw > 0 && ov / mw > 0.35) { bad = true; break; }
+                }
+              }
+              if (bad) {
+                var span = w.x1 - w.x0;
+                if (span > 4 && fsR > 0) {
+                  var nG = gs.length, step = span / nG;
+                  var hasLtrG = false, hasRtlG = false;
+                  for (var gm0 = 0; gm0 < nG; gm0++) {
+                    if (isLatinCh(gs[gm0].ch) || isDigitCh(gs[gm0].ch)) hasLtrG = true;
+                    else if (isArabicLetterCh(gs[gm0].ch)) hasRtlG = true;
+                  }
+                  if (hasLtrG && hasRtlG) {
+                    /* Partition into LTR vs non-LTR runs in reading order; position runs visually according to w.rtl */
+                    var segs = [], curSeg = null;
+                    for (var gm1 = 0; gm1 < nG; gm1++) {
+                      var gLtr = isLatinCh(gs[gm1].ch) || isDigitCh(gs[gm1].ch);
+                      if (!curSeg || curSeg.ltr !== gLtr) {
+                        curSeg = { ltr: gLtr, items: [] };
+                        segs.push(curSeg);
+                      }
+                      curSeg.items.push(gs[gm1]);
+                    }
+                    var xCur = w.rtl ? w.x1 : w.x0;
+                    for (var si0 = 0; si0 < segs.length; si0++) {
+                      var seg0 = segs[si0], slen = seg0.items.length;
+                      var segW = slen * step;
+                      var sLeft = w.rtl ? (xCur - segW) : xCur;
+                      for (var si1 = 0; si1 < slen; si1++) {
+                        if (seg0.ltr) {
+                          seg0.items[si1].x0 = sLeft + si1 * step;
+                          seg0.items[si1].x1 = sLeft + (si1 + 1) * step;
+                        } else {
+                          var sRight = sLeft + segW;
+                          seg0.items[si1].x0 = sRight - (si1 + 1) * step;
+                          seg0.items[si1].x1 = sRight - si1 * step;
+                        }
+                      }
+                      xCur = w.rtl ? (xCur - segW) : (xCur + segW);
+                    }
+                  } else {
+                    for (var gq3 = 0; gq3 < nG; gq3++) {
+                      if (w.rtl) {  /* reading right-to-left: first char rightmost */
+                        gs[gq3].x0 = w.x1 - (gq3 + 1) * step;
+                        gs[gq3].x1 = w.x1 - gq3 * step;
+                      } else {
+                        gs[gq3].x0 = w.x0 + gq3 * step;
+                        gs[gq3].x1 = w.x0 + (gq3 + 1) * step;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            gl = [];
+            for (var gi2 = 0; gi2 < gs.length; gi2++) {
+              gl.push([gs[gi2].ch, Math.round(gs[gi2].x0 * 100) / 100, Math.round(gs[gi2].x1 * 100) / 100]);
+            }
+            /* v1.52: CHAR-BOX RECONSTRUCTION — AFFIX/merge passes can put a
+               ZWNJ (or a merged affix) into w.t that has no glyph in w.g, so
+               gl.length < t.length. Java clamps cs to the shorter list and
+               the highlight of the last letters lands one char off the copied
+               text. Rebuild gl so EVERY char of t has a box: missing chars get
+               a zero-width box in the gap between their neighbours. */
+            if (gl.length !== w.t.length) {
+              var used = 0, glNew = [];
+              for (var gi4 = 0; gi4 < w.t.length; gi4++) {
+                var ch4 = w.t.charAt(gi4);
+                if (used < gs.length && gs[used].ch === ch4) {
+                  glNew.push([gs[used].ch, Math.round(gs[used].x0 * 100) / 100, Math.round(gs[used].x1 * 100) / 100]);
+                  used++;
+                } else {
+                  var nx = used < gs.length ? gs[used] : null;
+                  var pv2 = glNew.length ? { x0: glNew[glNew.length - 1][1], x1: glNew[glNew.length - 1][2] } : null;
+                  var bx0, bx1;
+                  if (nx && pv2) {
+                    var mid = (Math.min(pv2.x0, pv2.x1) + Math.max(nx.x0, nx.x1)) / 2;
+                    bx0 = mid - 0.5; bx1 = mid + 0.5;
+                  } else if (nx) {
+                    bx0 = w.rtl ? Math.max(nx.x0, nx.x1) - 1 : Math.min(nx.x0, nx.x1);
+                    bx1 = bx0 + 1;
+                  } else if (pv2) {
+                    bx0 = w.rtl ? Math.min(pv2.x0, pv2.x1) - 1 : Math.max(pv2.x0, pv2.x1);
+                    bx1 = bx0 + 1;
+                  } else { bx0 = w.x0; bx1 = Math.min(w.x0 + 1, w.x1); }
+                  glNew.push([ch4, Math.round(bx0 * 100) / 100, Math.round(bx1 * 100) / 100]);
+                }
+              }
+              gl = glNew;
+            }
+          }
+          wire.push([w.x0, w.y0, w.x1, w.y1, w.line, w.t, w.rtl, w.gap, w.br,
+                     w.zg ? 1 : 0, gl || []]);
+        }
+        AndroidSearch.onSelPage(p, JSON.stringify({ vw: res.vw, vh: res.vh, w: wire }));
+      } catch (e) {
+        selWant = 0;
+        if (window.AndroidSearch) AndroidSearch.onSelError(String(e && e.message || e));
+        break;
+      }
+    }
+    selBusy = false;
+  } catch (e) {
+    selBusy = false;
+    if (window.AndroidSearch) AndroidSearch.onSelError(String(e && e.message || e));
+  }
+}
+
+async function requestToc(url) {
+  try {
+    destroyDoc();
+    var task = pdfjsLib.getDocument({ url: url, isEvalSupported: false, disableFontFace: true });
+    doc = await task.promise;
+    var outline = await doc.getOutline();
+    if (!outline || !outline.length) {
+      AndroidSearch.onToc('[]');
+      destroyDoc();
+      return;
+    }
+    var items = [];
+    async function walk(arr, depth) {
+      for (var i = 0; i < arr.length; i++) {
+        var o = arr[i];
+        var page = 0;
+        try {
+          var dest = o.dest;
+          if (typeof dest === 'string') dest = await doc.getDestination(dest);
+          if (Array.isArray(dest) && dest[0]) page = (await doc.getPageIndex(dest[0])) + 1;
+        } catch (e) {}
+        items.push({ t: o.title || 'بدون عنوان', p: page, d: depth });
+        if (o.items && o.items.length && items.length < 2000) await walk(o.items, depth + 1);
+      }
+    }
+    await walk(outline, 0);
+    AndroidSearch.onToc(JSON.stringify(items));
+    destroyDoc();
+  } catch (e) { reportErr(e); }
+}
+
+/* ============================================================
+   v1.37: full-text extraction for «تبدیل به Word» — walks the
+   requested pages (or all), rebuilds the reading-order text with
+   the SAME PkEngine word stream the copy/search paths use, and
+   streams it to Java page by page (bridge keeps pages small).
+   ============================================================ */
+var textGen = 0;
+
+async function extractText(url, password, pagesJson) {
+  var gen = ++textGen;
+  try {
+    destroyDoc();
+    var task = pdfjsLib.getDocument({ url: url, isEvalSupported: false, disableFontFace: true,
+                                       password: password || undefined });
+    doc = await task.promise;
+    if (gen !== textGen) { destroyDoc(); return; }
+    var total = doc.numPages;
+    var pages = null;
+    if (pagesJson && pagesJson.length) {
+      try { pages = JSON.parse(pagesJson); } catch (e) { pages = null; }
+    }
+    if (!pages || !pages.length) {
+      pages = [];
+      for (var i = 1; i <= total; i++) pages.push(i);
+    }
+    var done = 0;
+    for (var pi = 0; pi < pages.length; pi++) {
+      var p1 = pages[pi];
+      if (p1 < 1 || p1 > total) continue;
+      if (gen !== textGen) return;
+      var text = '';
+      try {
+        var page = await doc.getPage(p1);
+        var res = await PkEngine.pageWords(page);
+        page.cleanup();
+        text = PkEngine.wordsToText(res.words);
+      } catch (e) { text = ''; }
+      if (gen !== textGen) return;
+      AndroidSearch.onTextPage(p1, text);
+      done++;
+      if (done % 3 === 0 || done === pages.length) {
+        AndroidSearch.onTextProgress(done, pages.length);
+      }
+      await new Promise(function (r) { setTimeout(r, 0); }); // yield
+    }
+    if (gen === textGen) AndroidSearch.onTextDone(done);
+    destroyDoc();
+  } catch (e) {
+    if (gen === textGen) AndroidSearch.onTextError(String(e && e.message || e));
+  }
+}
+
+
+/* ============================================================
+   v1.38: LAYOUT extraction for «تبدیل به Word» — same battle-tested
+   word stream as copy/search, but each word keeps its geometry,
+   font key and effective size, and the font table is resolved from
+   pdf.js commonObjs (real name + bold/italic flags). Java then
+   rebuilds paragraphs with direction, alignment, font, size and
+   bold/italic — a real layout-preserving DOCX.
+   ============================================================ */
+async function pageLayout(page) {
+  const opList = await page.getOperatorList();
+  const OPS = (typeof pdfjsLib !== 'undefined' && pdfjsLib.OPS) ? pdfjsLib.OPS
+    : (typeof pdfjs !== 'undefined' && pdfjs.OPS ? pdfjs.OPS : null);
+  const vp = page.getViewport({ scale: 1 });
+  const glyphs = PkEngine.replayOps(opList, OPS);
+  const tf = vp.transform;
+  if (tf && tf.length >= 6) {
+    PkEngine.applyViewportTransform(glyphs, tf);
+    var words = PkEngine.glyphsToWords(glyphs, 0);
+  } else {
+    var words = PkEngine.glyphsToWords(glyphs, vp.height);
+  }
+
+  /* font table: resolve each distinct glyph font key via commonObjs */
+  var fkeys = {}, flist = [];
+  function fontIdx(k) {
+    if (k == null) return -1;
+    if (Object.prototype.hasOwnProperty.call(fkeys, k)) return fkeys[k];
+    var info = { n: '', b: 0, i: 0 };
+    try {
+      var fo = page.commonObjs.get(k);
+      if (fo) {
+        if (typeof fo.name === 'string' && fo.name) info.n = fo.name;
+        else if (typeof fo.loadedName === 'string') info.n = fo.loadedName;
+        if (fo.bold === true) info.b = 1;
+        if (fo.italic === true) info.i = 1;
+      }
+    } catch (e) { /* unresolved object — generic */ }
+    var idx = flist.length;
+    flist.push([info.n, info.b, info.i]);
+    fkeys[k] = idx;
+    return idx;
+  }
+
+  /* per word: [t, x0, y0, x1, y1, fs, fontIdx, rtl, line, gap, zg] */
+  var out = [];
+  for (var i2 = 0; i2 < words.length; i2++) {
+    var w = words[i2];
+    var fs = 0, fk = null;
+    if (w.g) {
+      for (var k2 = 0; k2 < w.g.length; k2++) {
+        var gg = w.g[k2];
+        if (!gg.ch || gg.ch === ' ') continue;
+        if (gg.fs && gg.fs > fs) fs = gg.fs;
+        if (gg.fo) fk = gg.fo;
+      }
+    }
+    if (!fs) fs = (w.y1 - w.y0) / 1.25 || 10;
+    out.push([w.t, Math.round(w.x0 * 100) / 100, Math.round(w.y0 * 100) / 100,
+      Math.round(w.x1 * 100) / 100, Math.round(w.y1 * 100) / 100,
+      Math.round(fs * 100) / 100, fontIdx(fk), w.rtl ? 1 : 0, w.line, w.gap,
+      w.zg ? 1 : 0]);
+  }
+  /* v1.43: IMAGE BLOCK detection — same operator list, second pass.
+     Tracks the graphics CTM through transform/save/restore and records
+     the placement rect of every painted image (unit square × CTM) in
+     USER SPACE, then maps it through the viewport transform like the
+     glyphs — Java crops the same rect from the pdfium render. */
+  var imgRects = [];
+  try {
+    var ctm = [1, 0, 0, 1, 0, 0];
+    var gstack2 = [];
+    var fn2 = opList.fnArray, args2 = opList.argsArray;
+    function mul(m, t) {
+      return [m[0] * t[0] + m[1] * t[2], m[0] * t[1] + m[1] * t[3],
+              m[2] * t[0] + m[3] * t[2], m[2] * t[1] + m[3] * t[3],
+              m[4] * t[0] + m[5] * t[2] + t[4], m[4] * t[1] + m[5] * t[3] + t[5]];
+    }
+    function quad(m) {
+      /* unit-square corners through the matrix */
+      var xs = [m[4], m[0] + m[4], m[2] + m[4], m[0] + m[2] + m[4]];
+      var ys = [m[5], m[1] + m[5], m[3] + m[5], m[1] + m[3] + m[5]];
+      return [Math.min.apply(null, xs), Math.min.apply(null, ys),
+              Math.max.apply(null, xs), Math.max.apply(null, ys)];
+    }
+    var PAINT_IMG = {};
+    if (OPS) {
+      PAINT_IMG[OPS.paintImageXObject] = 1;
+      PAINT_IMG[OPS.paintInlineImageXObject] = 1;
+      PAINT_IMG[OPS.paintJpegXObject] = 1;
+      PAINT_IMG[OPS.paintImageMaskXObject] = 1;
+    }
+    for (var oi = 0; oi < fn2.length; oi++) {
+      var of = fn2[oi];
+      if (of === OPS.save) gstack2.push(ctm);
+      else if (of === OPS.restore) { if (gstack2.length) ctm = gstack2.pop(); }
+      else if (of === OPS.transform) ctm = mul(ctm, args2[oi]);
+      else if (PAINT_IMG[of]) {
+        var q = quad(ctm);
+        if (q[2] - q[0] > 8 && q[3] - q[1] > 8) imgRects.push(q);
+      }
+    }
+  } catch (eImg) { imgRects = []; }
+  var imOut = [];
+  if (tf && tf.length >= 6) {
+    for (var ri = 0; ri < imgRects.length; ri++) {
+      var q2 = imgRects[ri];
+      var corners = [[q2[0], q2[1]], [q2[2], q2[1]], [q2[0], q2[3]], [q2[2], q2[3]]];
+      var vx0 = 1e9, vy0 = 1e9, vx1 = -1e9, vy1 = -1e9;
+      for (var ci = 0; ci < 4; ci++) {
+        var px = tf[0] * corners[ci][0] + tf[2] * corners[ci][1] + tf[4];
+        var py = tf[1] * corners[ci][0] + tf[3] * corners[ci][1] + tf[5];
+        if (px < vx0) vx0 = px; if (px > vx1) vx1 = px;
+        if (py < vy0) vy0 = py; if (py > vy1) vy1 = py;
+      }
+      imOut.push([Math.round(vx0 * 100) / 100, Math.round(vy0 * 100) / 100,
+                  Math.round(vx1 * 100) / 100, Math.round(vy1 * 100) / 100]);
+    }
+  }
+  /* merge rects that overlap heavily (one image drawn in clipped tiles) */
+  var imMerged = [];
+  for (var imi = 0; imi < imOut.length; imi++) {
+    var a = imOut[imi], taken = false;
+    for (var imj = 0; imj < imMerged.length; imj++) {
+      var b = imMerged[imj];
+      var lox = Math.max(a[0], b[0]), loy = Math.max(a[1], b[1]);
+      var hix = Math.min(a[2], b[2]), hiy = Math.min(a[3], b[3]);
+      if (hix > lox && hiy > loy) {
+        var ov = (hix - lox) * (hiy - loy);
+        var mn = Math.min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]));
+        if (ov > 0.55 * Math.max(1, mn)) {
+          b[0] = Math.min(b[0], a[0]); b[1] = Math.min(b[1], a[1]);
+          b[2] = Math.max(b[2], a[2]); b[3] = Math.max(b[3], a[3]);
+          taken = true; break;
+        }
+      }
+    }
+    if (!taken) imMerged.push(a.slice());
+  }
+
+  return { vw: Math.round(vp.width), vh: Math.round(vp.height), f: flist, w: out, im: imMerged };
+}
+
+var layoutGen = 0;
+async function extractLayout(url, password, pagesJson) {
+  var gen = ++layoutGen;
+  try {
+    destroyDoc();
+    var task = pdfjsLib.getDocument({ url: url, isEvalSupported: false, disableFontFace: true,
+                                       password: password || undefined });
+    doc = await task.promise;
+    if (gen !== layoutGen) { destroyDoc(); return; }
+    var total = doc.numPages;
+    var pages = null;
+    if (pagesJson && pagesJson.length) {
+      try { pages = JSON.parse(pagesJson); } catch (e) { pages = null; }
+    }
+    if (!pages || !pages.length) {
+      pages = [];
+      for (var i = 1; i <= total; i++) pages.push(i);
+    }
+    var done = 0;
+    for (var pi = 0; pi < pages.length; pi++) {
+      var p1 = pages[pi];
+      if (p1 < 1 || p1 > total) continue;
+      if (gen !== layoutGen) return;
+      var payload = null;
+      try {
+        var page = await doc.getPage(p1);
+        payload = await pageLayout(page);
+        page.cleanup();
+      } catch (e) { payload = null; }
+      if (gen !== layoutGen) return;
+      try {
+        AndroidSearch.onLayoutPage(p1, payload ? JSON.stringify(payload) : null);
+      } catch (eBridge) {
+        if (gen === layoutGen) AndroidSearch.onLayoutError(String(eBridge && eBridge.message || eBridge));
+        destroyDoc();
+        return;
+      }
+      done++;
+      if (done % 3 === 0 || done === pages.length) {
+        AndroidSearch.onLayoutProgress(done, pages.length);
+      }
+      await new Promise(function (r) { setTimeout(r, 0); }); // yield
+    }
+    if (gen === layoutGen) AndroidSearch.onLayoutDone(done);
+    destroyDoc();
+  } catch (e) {
+    if (gen === layoutGen) AndroidSearch.onLayoutError(String(e && e.message || e));
+  }
+}
+
+window.addEventListener('load', function () { onReady(); });
+if (document.readyState === 'complete' || document.readyState === 'interactive') onReady();
+</script>
+</body>
+</html>

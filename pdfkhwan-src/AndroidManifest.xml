@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pdfkhwan.app"
+    android:versionCode="153"
+    android:versionName="1.53">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+
+    <!-- Library of ALL PDFs + PowerPoint files on the device:
+         - Android 10 and below: classic storage read (runtime request)
+         - Android 11+: "All files access" (user grants in system settings)
+         Still NO INTERNET permission — the app is 100% offline. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <!-- rename / move / delete files on Android 10 and below -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- v1.37: subtle haptic tick when pinch-zoom crosses 100% -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- v1.47: بخش ۲۰ — دانلود خودِ مدل‌های صوتی Piper از HuggingFace.
+         اینترنت برای هیچ چیز دیگری استفاده نمی‌شود؛ خواندن PDF و تولید صدا
+         کاملاً آفلاین است. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- v1.47: بخش ۱۹ — خواندن در پس‌زمینه + اعلان مدیا -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Queries: needed on Android 11+ so we can discover OEM file managers
+         (Samsung My Files, Xiaomi File Explorer, Redmi Files, Huawei Files,
+         Google Files, etc.) when the user taps "Open in file manager". -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="*/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="http" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.GET_CONTENT" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT" />
+        </intent>
+        <package android:name="com.sec.android.app.myfiles" />
+        <package android:name="com.mi.android.globalFileexplorer" />
+        <package android:name="com.android.fileexplorer" />
+        <package android:name="com.huawei.hidisk" />
+        <package android:name="com.google.android.documentsui" />
+        <package android:name="com.android.documentsui" />
+        <!-- v7: OEM file managers FileOps probes (queryIntentActivities)
+             but could not see on Android 11+ without these declarations -->
+        <package android:name="com.oneplus.filemanager" />
+        <package android:name="com.coloros.files" />
+        <package android:name="com.android.filemanager" />
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:largeHeap="true"
+        android:hardwareAccelerated="true"
+        android:requestLegacyExternalStorage="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- ============================================================
+                 PDF intent-filters (very tight per-mimeType filters so the
+                 Android "Always / Set as default" dialog always shows up).
+                 Two filter SHAPES are emitted per mime:
+                   (a) content/file scheme + tight mimeType + BROWSABLE
+                       — covers system shares, downloads, file managers.
+                   (b) file scheme + mimeType + extension pattern + DEFAULT
+                       — covers the case where some launchers hand out
+                       a file:// URL with no mime (Samsung browser, etc.).
+                 ============================================================ -->
+
+            <!-- PDF: application/pdf -->
+            <intent-filter android:label="باز کردن PDF">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن PDF">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.pdf" />
+                <data android:pathPattern=".*\\.[Pp][Dd][Ff]" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن PDF">
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+
+            <!-- PPTX: Office Open XML Presentation -->
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.pptx" />
+                <data android:pathPattern=".*\\.[Pp][Pp][Tt][Xx]" />
+            </intent-filter>
+            <intent-filter android:label="ویرایش پاورپوینت">
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+            </intent-filter>
+
+            <!-- PPT (legacy binary PowerPoint 97-2003) -->
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.ms-powerpoint" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.ppt" />
+                <data android:pathPattern=".*\\.[Pp][Pp][Tt]" />
+            </intent-filter>
+
+            <!-- PPS / PPSX (slideshow variants) -->
+            <intent-filter android:label="باز کردن اسلایدشو">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.slideshow" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن اسلایدشو">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="file" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.ppsx" />
+                <data android:pathPattern=".*\\.[Pp][Pp][Ss][Xx]" />
+            </intent-filter>
+            <intent-filter android:label="باز کردن اسلایدشو">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.ms-powerpoint.slideshow" />
+                <!-- v7: extension-only file managers need pathPatterns, not just MIME -->
+                <data android:pathPattern=".*\\.pps" />
+                <data android:pathPattern=".*\\.[Pp][Pp][Ss]" />
+            </intent-filter>
+
+            <!-- Macro-enabled PowerPoint variants (.pptm, .ppsm, .potm, .potx) -->
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.ms-powerpoint.presentation.macroEnabled.12" /> <!-- v7 FIX: correct MIME casing -->
+            </intent-filter>
+            <intent-filter android:label="باز کردن پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation.macroEnabled.12" /> <!-- v7 FIX: correct MIME casing -->
+            </intent-filter>
+            <intent-filter android:label="باز کردن قالب پاورپوینت">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.template" />
+                <data android:pathPattern=".*\\.potx" />
+                <data android:pathPattern=".*\\.potm" />
+                <data android:pathPattern=".*\\.pptm" />
+                <data android:pathPattern=".*\\.ppsm" />
+            </intent-filter>
+
+            <!-- Generic SEND for share sheet ("share to PDF خوان") -->
+            <intent-filter android:label="باز کردن در PDF خوان">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+                <data android:mimeType="application/vnd.ms-powerpoint" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.slideshow" />
+                <data android:mimeType="application/vnd.ms-powerpoint.slideshow" />
+            </intent-filter>
+
+            <!-- EDIT intent for editing flows from launchers -->
+            <intent-filter android:label="ویرایش پاورپوینت">
+                <action android:name="android.intent.action.EDIT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+                <data android:mimeType="application/vnd.ms-powerpoint" />
+            </intent-filter>
+
+            <!-- ============================================================
+                 Default-app capability (Android 11+, API 30+):
+                 lets the user set PDF خوان as the DEFAULT handler for
+                 PDF/PPT/PPTX from system settings → "Default apps".
+                 ============================================================ -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />
+                <data android:mimeType="application/vnd.ms-powerpoint" />
+                <data android:mimeType="application/vnd.openxmlformats-officedocument.presentationml.slideshow" />
+                <data android:mimeType="application/vnd.ms-powerpoint.slideshow" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ReaderActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density" />
+
+        <!-- PowerPoint editor (create / read / edit / save .pptx) -->
+        <activity
+            android:name=".PptEditorActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density" />
+
+        <!-- v1.47: بخش ۲۰ — مدیریت مدل‌های صوتی (دانلود/درون‌ریزی/حذف) -->
+        <activity
+            android:name="com.pdfkhwan.tts.VoiceModelsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density" />
+
+        <!-- v1.47: بخش ۱۹ — سرویس خواندن در پس‌زمینه با اعلان مدیا -->
+        <service
+            android:name="com.pdfkhwan.tts.TtsService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <provider
+            android:name=".ShareProvider"
+            android:authorities="com.pdfkhwan.app.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>

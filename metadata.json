@@ -1,0 +1,6 @@
+{
+  "name": "پارس‌خوان PDF — موتور استخراج و تبدیل فارسی",
+  "description": "نمایشگر PDF، موتور استخراج دقیق متون فارسی و دوزبانه (RTL/LTR)، کپی استاندارد و تبدیل به Word (.docx)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

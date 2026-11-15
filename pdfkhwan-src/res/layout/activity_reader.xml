@@ -1,0 +1,347 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/reader_bg">
+
+    <com.github.barteksc.pdfviewer.PDFView
+        android:id="@+id/pdfView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- shown while pdfium opens/decodes the document -->
+    <ProgressBar
+        android:id="@+id/loading"
+        style="?android:attr/progressBarStyleLarge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center" />
+
+    <!-- ================= TOP BAR ================= -->
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@drawable/bg_bar"
+        android:layout_margin="8dp"
+        android:paddingStart="6dp"
+        android:paddingEnd="6dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
+
+        <ImageButton
+            android:id="@+id/btnBack"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_back"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="back" />
+
+        <TextView
+            android:id="@+id/docTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="4dp"
+            android:textColor="@color/text"
+            android:textSize="13.5sp"
+            android:textStyle="bold"
+            android:singleLine="true"
+            android:ellipsize="middle" />
+
+        <!-- v1.37: direct drawing-mode toggle, beside the annotation hub -->
+        <ImageButton
+            android:id="@+id/btnPen"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_ann_pen"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="pen" />
+
+        <!-- v1.33: annotation hub (notes, lists, backup) -->
+        <ImageButton
+            android:id="@+id/btnAnnotate"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_ann_page"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="annotate" />
+
+        <ImageButton
+            android:id="@+id/btnSearch"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_search"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="search" />
+
+        <ImageButton
+            android:id="@+id/btnToc"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_toc"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="toc" />
+
+        <ImageButton
+            android:id="@+id/btnThumbs"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_grid"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="thumbnails" />
+
+        <ImageButton
+            android:id="@+id/btnMenu"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@drawable/ic_menu"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="menu" />
+    </LinearLayout>
+
+    <!-- ================= SEARCH PANEL ================= -->
+    <LinearLayout
+        android:id="@+id/searchPanel"
+        android:layout_margin="12dp"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="@drawable/bg_panel"
+        android:visibility="gone"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="جستجو در متن کتاب"
+                android:textColor="@color/text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/btnSearchClose"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:src="@drawable/ic_close"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="close" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="10dp"
+            android:gravity="center_vertical">
+
+            <EditText
+                android:id="@+id/searchInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="عبارت را بنویس…"
+                android:textColorHint="#46587A"
+                android:textColor="@color/text"
+                android:textSize="13.5sp"
+                android:background="@drawable/bg_bar"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:paddingTop="10dp"
+                android:paddingBottom="10dp"
+                android:singleLine="true"
+                android:imeOptions="actionSearch"
+                android:inputType="text" />
+
+            <TextView
+                android:id="@+id/btnDoSearch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_button"
+                android:text="جستجو"
+                android:textColor="@color/accent"
+                android:textStyle="bold"
+                android:textSize="13sp"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:paddingTop="11dp"
+                android:paddingBottom="11dp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/searchProgressRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="10dp"
+            android:visibility="gone">
+
+            <ProgressBar
+                style="?android:attr/progressBarStyleHorizontal"
+                android:id="@+id/searchProgress"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:progressTint="@color/accent"
+                android:progressBackgroundTint="@color/border" />
+
+            <TextView
+                android:id="@+id/searchProgressText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:textColor="@color/muted"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/btnSearchCancel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:text="لغو"
+                android:textColor="@color/danger"
+                android:textSize="12.5sp"
+                android:textStyle="bold"
+                android:padding="6dp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/searchStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="@color/muted"
+            android:textSize="11.5sp"
+            android:visibility="gone" />
+
+        <ListView
+            android:id="@+id/searchResults"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:layout_marginTop="6dp"
+            android:divider="@null"
+            android:dividerHeight="0dp"
+            android:scrollbars="none" />
+    </LinearLayout>
+
+    <!-- ================= TOC PANEL ================= -->
+    <LinearLayout
+        android:id="@+id/tocPanel"
+        android:layout_margin="12dp"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="@drawable/bg_panel"
+        android:visibility="gone"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="فهرست مطالب"
+                android:textColor="@color/text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/btnTocClose"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:src="@drawable/ic_close"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="close" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tocStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+
+        <ListView
+            android:id="@+id/tocList"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:layout_marginTop="8dp"
+            android:divider="@null"
+            android:dividerHeight="0dp"
+            android:scrollbars="none" />
+    </LinearLayout>
+
+    <!-- ================= THUMBNAILS PANEL ================= -->
+    <LinearLayout
+        android:id="@+id/thumbsPanel"
+        android:layout_margin="12dp"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="@drawable/bg_panel"
+        android:visibility="gone"
+        android:padding="14dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="صفحات"
+                android:textColor="@color/text"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/btnThumbsClose"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:src="@drawable/ic_close"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="close" />
+        </LinearLayout>
+
+        <GridView
+            android:id="@+id/thumbsGrid"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:layout_marginTop="8dp"
+            android:numColumns="3"
+            android:horizontalSpacing="8dp"
+            android:verticalSpacing="8dp"
+            android:scrollbars="none"
+            android:listSelector="@android:color/transparent" />
+    </LinearLayout>
+
+    <!-- hidden pdf.js search/toc engine -->
+    <WebView
+        android:id="@+id/searchWeb"
+        android:layout_width="1dp"
+        android:layout_height="1dp" />
+</FrameLayout>
